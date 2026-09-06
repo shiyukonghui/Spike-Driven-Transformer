@@ -1,0 +1,27 @@
+[package]
+name = "rust-sdt"
+version = "0.1.0"
+edition = "2021"
+description = "Spike-Driven Transformer 的 Rust + Burn 实现（用于与 PyTorch 参考实现进行结果对照）"
+
+[dependencies]
+# burn 深度学习框架（wgpu 后端支持 GPU；ndarray 后端用于 CI/调试；autodiff 提供训练用自动微分后端包装）
+burn = { version = "0.18.0", features = ["wgpu", "ndarray", "autodiff"] }
+# zip 容器（NPZ 读取）
+zip = { version = "0.6", default-features = false, features = ["deflate"] }
+ndarray = "0.15"
+# 命令行参数解析
+clap = { version = "4", features = ["derive"] }
+# 序列化/反序列化（burn 记录器使用）
+serde = { version = "1", features = ["derive"] }
+# 伪随机数（用于数据混洗，固定种子保证可复现）
+rand = "0.8"
+# 正态分布采样（与 rand 0.8 配套，用于 trunc_normal 初始化）
+rand_distr = "0.4"
+
+[features]
+# 调试用：打印前向各阶段张量形状
+debug_shape = []
+
+[profile.release]
+opt-level = 3

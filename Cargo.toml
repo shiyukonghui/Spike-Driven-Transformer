@@ -1,0 +1,5 @@
+# 根目录仅作为 Cargo workspace 占位清单（原为无效的独立 package 清单），
+# 实际的 Rust 实现位于 rust-sdt 子目录中
+[workspace]
+members = ["rust-sdt"]
+resolver = "2"

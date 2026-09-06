@@ -9,3 +9,9 @@ pretrain.py
 *.tar
 *.npy
 *.zip
+.pylibs/
+target/
+*.txt
+*.npz
+*.csv
+*.log
