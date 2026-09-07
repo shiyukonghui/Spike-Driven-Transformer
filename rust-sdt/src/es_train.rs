@@ -1505,7 +1505,6 @@ pub fn run_train_es_factored(args: EsArgs) {
             .iter()
             .map(|p| Tensor::<B, 2>::zeros(p.dims(), device))
             .collect();
-        let mut ones_acc: Vec<Tensor<B, 2>> = grad_acc.clone();
         let mut raws_all: Vec<f32> = Vec::with_capacity(args.pop);
         let mut epoch_correct = 0usize;
 
@@ -1559,18 +1558,18 @@ pub fn run_train_es_factored(args: EsArgs) {
             fwd_time += t1.elapsed().as_secs_f32();
 
             // ---- 3) 梯度充分统计量累积（同一批因子，无 CPU 回传）----
+            // M1 优化（ES_MANIFOLD_NOTE.md §一）：反对称对共享 seed、ΔW 严格互为相反数
+            // （gen_chunk_flat：A 区乘 ±sign、B 区共享；dense 整体 ±），
+            // pop=n_train 时每对完整 ⇒ Σ_n ΔW_n ≡ 0（精确恒零）⇒ ones_acc 全删。
             for si in 0..lora_slots.len() {
                 let (a, b) = &factors.lora[si];
                 grad_acc[si] = grad_acc[si].clone() + lora_grad_einsum(a, b, &raw, true);
-                ones_acc[si] = ones_acc[si].clone() + lora_grad_einsum(a, b, &raw, false);
             }
             let nd = lora_slots.len();
             for di in 0..dense_slots.len() {
                 let noise = &factors.dense[di];
                 let g = noise.clone().transpose().matmul(raw.clone().reshape([cand_slice.len(), 1])); // [n,1]
-                let o = noise.clone().sum_dim(0).reshape([noise.dims()[1], 1]); // [n,1]
                 grad_acc[nd + di] = grad_acc[nd + di].clone() + g;
-                ones_acc[nd + di] = ones_acc[nd + di].clone() + o;
             }
             raws_all.extend(
                 raw.into_data()
@@ -1581,6 +1580,7 @@ pub fn run_train_es_factored(args: EsArgs) {
         }
 
         // ---- 4) 全局 z-score（一次）+ 单次 AdamW + 写回 ----
+        // pop=n_train 时 ΣΔW≡0（M1），修正项 (g − o·mean) ≡ g，直接乘 scale。
         let n_used = raws_all.len();
         let mean = raws_all.iter().sum::<f32>() / n_used as f32;
         let var = (raws_all.iter().map(|v| v * v).sum::<f32>() / n_used as f32 - mean * mean).max(0.0);
@@ -1588,8 +1588,7 @@ pub fn run_train_es_factored(args: EsArgs) {
         let scale = -1.0 / (stdv * (n_used as f32).sqrt());
         let grads: Vec<Tensor<B, 2>> = grad_acc
             .into_iter()
-            .zip(ones_acc.into_iter())
-            .map(|(g, o)| (g - o.mul_scalar(mean)).mul_scalar(scale))
+            .map(|g| g.mul_scalar(scale))
             .collect();
         optim.step(&mut params2d, &grads);
         write_back_factored(&mut base, &lora_slots, &dense_slots, &params2d);
