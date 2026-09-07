@@ -83,6 +83,40 @@ pub fn lif_seq<B: Backend, const D: usize>(x: Tensor<B, D>, threshold: f64) -> T
     }
     Tensor::cat(spikes, 0)
 }
+
+/// 温度松弛 LIF 单步（TSES，ES_MANIFOLD_NOTE.md 定理 3.1/3.2）：
+/// 读出 s = σ(β(h−thr)) —— 恰为硬 LIF 对 Logistic(0,1/β) 阈值噪声的精确期望；
+/// 连续重置 v_new = (1−s)·h（β→∞ 时退化为硬重置 v_reset=0 语义）。
+/// σ'(β(h−thr)) = β·σ(1−σ) 即 STE(α=β) 代理族。
+pub fn lif_step_relaxed<B: Backend, const D: usize>(
+    v_prev: Tensor<B, D>,
+    x: Tensor<B, D>,
+    threshold: f64,
+    beta: f64,
+) -> (Tensor<B, D>, Tensor<B, D>) {
+    let h = v_prev.clone() + (x - v_prev.clone()) / TAU;
+    let s = burn::tensor::activation::sigmoid((h.clone() - threshold) * beta);
+    let v_new = (1.0f32 - s.clone()) * h;
+    (s, v_new)
+}
+
+/// 温度松弛多时间步 LIF（TSES 前向），接口与 lif_seq 一致。
+pub fn lif_seq_relaxed<B: Backend, const D: usize>(
+    x: Tensor<B, D>,
+    threshold: f64,
+    beta: f64,
+) -> Tensor<B, D> {
+    let t = x.dims()[0];
+    let mut v = Tensor::zeros(x.clone().slice([0..1]).shape(), &x.device());
+    let mut outs: Vec<Tensor<B, D>> = Vec::with_capacity(t);
+    for i in 0..t {
+        let xt = x.clone().slice([i..i + 1]);
+        let (s, v_new) = lif_step_relaxed(v, xt, threshold, beta);
+        v = v_new;
+        outs.push(s);
+    }
+    Tensor::cat(outs, 0)
+}
 /// SPS 中的 maxpool：kernel=3, stride=2, padding=1（ceil_mode=False）。
 /// 输入 [B, C, H, W]，输出 [B, C, (H+2-3)/2+1, ...]（floor 语义与 PyTorch 一致）。
 pub fn maxpool2d_3x3_s2<B: Backend>(x: Tensor<B, 4>) -> Tensor<B, 4> {

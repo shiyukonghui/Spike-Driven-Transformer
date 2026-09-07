@@ -110,6 +110,9 @@ cargo run --release -- train-compare
 | burn 0.21 显存问题 | **已修复**（T=4 全程零 OOM，~21s/epoch，0.18 基线 79s/epoch 的 3.8×） |
 | Burn 训练（0.21 + 显存修复） | 100 epoch：ep100 loss 1.8257→0.1289 / top1 65.55%，全程零 OOM |
 | train-compare（100 epoch 对照） | **PASS**（top1 相对差 0.15% ≤5%；loss 绝对差 0.031 ≤0.1；口径见 check_log 七节） |
+| EggRoll-ES 演化策略训练（无反传） | 完成：`train-es` 双模式——factored 因式噪声前向（逐图候选，**每次更新 8000 个独立噪声方向**，SPS 冻结，4.4GB）best_val **16.65%**；cache ΔW 物化（800 方向）15.70%。SGD 基线 65.55%；ES 收敛快 2 倍但受 100 次更新/SPS 冻结制约，详见 check_log 八/九节 |
+| TSES 温度松弛 ES（数学指导优化） | 完成：按 ES_MANIFOLD_NOTE.md 定理 3 实现 σ(β(h−thr)) 松弛 LIF fitness 前向 + β 退火 4→16；val **17.10%**（超硬脉冲 v2 的 16.65%），且**终点=峰值、尾部单调上升**（v2 峰值后衰减）——"信号通道恢复"的机制预测在全尺度复现；数值验证（引理 1 平板流形、一致性 |cos|→0.99）见 `rust-sdt/ES_MANIFOLD_NOTE.md` §9 与 `scripts/verify_es_math.py` |
+| 全量 CIFAR-10 ES 测试（50000/10000） | 已终止（用户裁决：34 epoch，best_val **17.68%**）。SGD 参考 5 epoch 即 **58.95%**（655s）——方向数 ×6.25 仅 +1.0pp，确认 ES 与反传的差距是数量级且不随数据缩小，ES 定位为无梯度场景工具而非主优化器，详见 check_log 第十节 |
 
 显存修复摘要（三叠加根因，详见 [rust-sdt/check_log.txt](rust-sdt/check_log.txt)）：
 1. burn-fusion 0.21 延迟 drop（ContinueDrop 不触发 drain）→ 本地补丁恢复 0.18 语义

@@ -11,6 +11,7 @@
 
 mod check;
 mod config;
+mod es_train;
 mod loader;
 mod model;
 mod ops;
@@ -89,6 +90,64 @@ enum Command {
         #[arg(long, default_value_t = 300)]
         iters: u32,
     },
+    /// 演化策略（EggRoll-ES，无反向传播）训练：LoRA 低秩扰动 + loglik 奖励 +
+    /// z-score + AdamW，全程内层 wgpu 后端（详见 es_train.rs 模块注释）
+    TrainEs {
+        /// 训练轮数（1 epoch = 全部训练图过一遍）
+        #[arg(long, default_value_t = 100)]
+        epochs: u32,
+        /// 数据目录（CIFAR-10 npz 解包目录）
+        #[arg(long, default_value = "data/cifar10")]
+        data_dir: String,
+        /// 随机种子
+        #[arg(long, default_value_t = 42)]
+        seed: u64,
+        /// 初始化权重 NPZ 路径（默认 artifacts/sdt_reference.npz，与 SGD 基线同源）
+        #[arg(long, default_value = "artifacts/sdt_reference.npz")]
+        weights: String,
+        /// 时间步数 T（静态帧重复次数）
+        #[arg(long, default_value_t = 4)]
+        time_steps: usize,
+        /// 跳过静态校准
+        #[arg(long, default_value_t = false)]
+        no_calibrate: bool,
+        /// 每代候选数（偶数，候选成对反对称；factored 模式下 = 噪声方向数 = 图数）
+        #[arg(long, default_value_t = 8000)]
+        pop: usize,
+        /// 每候选评估的图像块大小（cache 模式：块内共享扰动；factored 模式固定 1）
+        #[arg(long, default_value_t = 1)]
+        es_batch: usize,
+        /// 实现模式：factored（默认，因式分解噪声前向，SPS 冻结）| cache（ΔW 物化缓存）
+        #[arg(long, default_value = "factored")]
+        mode: String,
+        /// factored 模式每 chunk 的候选（图）数
+        #[arg(long, default_value_t = 128)]
+        chunk: usize,
+        /// 扰动幅度 σ（相对值：每槽实际幅度 = σ × 该层权重 std）
+        #[arg(long, default_value_t = 0.5)]
+        sigma: f32,
+        /// LoRA 秩 r
+        #[arg(long, default_value_t = 32)]
+        rank: usize,
+        /// AdamW 学习率
+        #[arg(long, default_value_t = 0.01)]
+        lr: f64,
+        /// 每 N 个 epoch 评估一次验证集
+        #[arg(long, default_value_t = 1)]
+        validate_every: u32,
+        /// CSV 输出路径
+        #[arg(long, default_value = "artifacts/train_burn_es.csv")]
+        csv_out: String,
+        /// TSES 温度松弛：ES fitness 前向用 σ(β(h−thr)) 松弛 LIF（ES_MANIFOLD_NOTE 定理 3）
+        #[arg(long, default_value_t = false)]
+        relax: bool,
+        /// 松弛温度 β（= STE α；4.0 与 spikingjelly 代理一致）
+        #[arg(long, default_value_t = 4.0)]
+        beta: f32,
+        /// β 退火周期：每 N 个 epoch β×2（上限 16）；0 = 固定 β
+        #[arg(long, default_value_t = 0)]
+        beta_anneal_every: u32,
+    },
 }
 
 fn main() {
@@ -132,6 +191,47 @@ fn main() {
         }
         Command::MemProbe { iters } => {
             crate::train::run_mem_probe(iters);
+        }
+        Command::TrainEs {
+            epochs,
+            data_dir,
+            seed,
+            weights,
+            time_steps,
+            no_calibrate,
+            pop,
+            es_batch,
+            sigma,
+            rank,
+            lr,
+            validate_every,
+            csv_out,
+            mode,
+            chunk,
+            relax,
+            beta,
+            beta_anneal_every,
+        } => {
+            crate::es_train::run_train_es(crate::es_train::EsArgs {
+                epochs,
+                data_dir,
+                seed,
+                weights: Some(weights),
+                time_steps,
+                no_calibrate,
+                pop,
+                es_batch,
+                sigma,
+                rank,
+                lr,
+                validate_every,
+                csv_out,
+                mode,
+                chunk,
+                relax,
+                beta,
+                beta_anneal_every,
+            });
         }
     }
 }

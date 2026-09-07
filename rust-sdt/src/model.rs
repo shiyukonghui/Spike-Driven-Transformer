@@ -221,7 +221,7 @@ pub fn forward_sps<B: Backend>(
 }
 
 /// [T, B, C, N] 视角变形：输入 [T,B,C,H,W] -> [T, B, heads, N, head_dim]
-fn reshape_heads<B: Backend>(
+pub fn reshape_heads<B: Backend>(
     x: Tensor<B, 5>,
     heads: usize,
     head_dim: usize,
@@ -237,7 +237,7 @@ fn reshape_heads<B: Backend>(
 }
 
 /// [T, B, heads, N, hd] -> [T, B, C, H, W]
-fn unshape_heads<B: Backend>(
+pub fn unshape_heads<B: Backend>(
     x: Tensor<B, 5>,
     heads: usize,
     head_dim: usize,

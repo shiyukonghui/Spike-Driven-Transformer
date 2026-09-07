@@ -1,0 +1,424 @@
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>TSES：训练期连续、部署期二值 —— 交互演示</title>
+<style>
+  :root{
+    --bg:#0f1420; --panel:#171e2e; --ink:#e8edf7; --dim:#9aa7bd;
+    --accent:#4fc3f7; --hard:#ff8a65; --relax:#69f0ae; --gold:#ffd54f;
+    --line:#2a3550;
+  }
+  *{box-sizing:border-box; margin:0; padding:0;}
+  body{background:var(--bg); color:var(--ink); font-family:"Microsoft YaHei","PingFang SC",sans-serif; line-height:1.65;}
+  header{padding:28px 20px 10px; text-align:center;}
+  header h1{font-size:26px; letter-spacing:1px;}
+  header p{color:var(--dim); margin-top:8px; font-size:14px;}
+  main{max-width:1060px; margin:0 auto; padding:16px 20px 60px;}
+  section{margin-top:28px;}
+  h2{font-size:19px; border-left:4px solid var(--accent); padding-left:12px; margin-bottom:14px;}
+  h3{font-size:15px; color:var(--accent); margin:14px 0 8px;}
+  p.note{color:var(--dim); font-size:13.5px; margin-bottom:12px;}
+  .cards{display:grid; grid-template-columns:repeat(3,1fr); gap:14px;}
+  .card{background:var(--panel); border:1px solid var(--line); border-radius:12px; padding:16px;}
+  .card .tag{display:inline-block; font-size:12px; padding:2px 10px; border-radius:20px; margin-bottom:10px;}
+  .card.b4 .tag{background:#1b3a5c; color:var(--accent);}
+  .card.b16 .tag{background:#4a3a14; color:var(--gold);}
+  .card.binf .tag{background:#143a26; color:var(--relax);}
+  .card b{font-size:15px;}
+  .card p{font-size:13px; color:var(--dim); margin-top:6px;}
+  .panel{background:var(--panel); border:1px solid var(--line); border-radius:12px; padding:18px;}
+  canvas{width:100%; display:block;}
+  .ctrl{display:flex; align-items:center; gap:14px; margin-top:10px; flex-wrap:wrap; font-size:13.5px;}
+  .ctrl label{color:var(--dim); white-space:nowrap;}
+  .ctrl input[type=range]{flex:1; min-width:140px;}
+  .val{font-family:Consolas,monospace; color:var(--gold); min-width:150px;}
+  button{background:#1b3a5c; color:var(--ink); border:1px solid var(--accent); border-radius:8px;
+         padding:7px 18px; cursor:pointer; font-size:13.5px;}
+  button:hover{background:#24507e;}
+  .readout{font-family:Consolas,monospace; font-size:13px; margin-top:8px;}
+  .readout .hard{color:var(--hard);} .readout .relax{color:var(--relax);}
+  .legend{display:flex; gap:22px; font-size:13px; color:var(--dim); margin-top:6px; flex-wrap:wrap;}
+  .dot{display:inline-block; width:10px; height:10px; border-radius:50%; margin-right:6px; vertical-align:middle;}
+  table{border-collapse:collapse; width:100%; font-size:13.5px; margin-top:8px;}
+  th,td{border:1px solid var(--line); padding:8px 12px; text-align:center;}
+  th{background:#1b2438; color:var(--accent);}
+  td.win{color:var(--relax); font-weight:bold;}
+  .pipe{display:grid; grid-template-columns:1fr 1fr; gap:16px; margin-top:10px;}
+  .pipe .col{background:var(--panel); border:1px solid var(--line); border-radius:12px; padding:16px;}
+  .pipe .col h3{margin-top:0;}
+  .step{display:flex; align-items:center; gap:8px; margin:7px 0; font-size:13px;}
+  .step .box{background:#1b2438; border:1px solid var(--line); border-radius:8px; padding:6px 10px; flex:1; text-align:center;}
+  .step .box.hl{border-color:var(--relax); color:var(--relax);}
+  .step .box.hlb{border-color:var(--hard); color:var(--hard);}
+  .step .arr{color:var(--dim);}
+  .bridge{margin:14px 0; text-align:center; color:var(--gold); font-size:13.5px;}
+  code{background:#1b2438; padding:1px 7px; border-radius:5px; font-size:12.5px; color:var(--gold);}
+  .formula{font-family:Consolas,monospace; background:#1b2438; border:1px solid var(--line);
+           border-radius:8px; padding:10px 14px; margin:10px 0; font-size:14px; overflow-x:auto;}
+  footer{color:var(--dim); font-size:12px; text-align:center; margin-top:40px;}
+  @media (max-width:760px){ .cards{grid-template-columns:1fr;} .pipe{grid-template-columns:1fr;} }
+</style>
+</head>
+<body>
+<header>
+  <h1>TSES：训练期连续、部署期二值</h1>
+  <p>σ(β(h−θ)) 同时是三件事：带阈值噪声的硬脉冲期望 · STE 的 mollifier · 二值阶跃的连续近似</p>
+</header>
+
+<main>
+  <!-- ================= 三个阶段 ================= -->
+  <section>
+    <h2>一、三个阶段（β 是唯一的旋钮）</h2>
+    <div class="cards">
+      <div class="card b4">
+        <span class="tag">训练早期 · β=4</span>
+        <b>平滑景观</b>
+        <p>读出 σ(4(h−θ)) 平缓。ES 的 fitness 对权重处处有斜率（定理 3.2：与解析梯度 cos≈0.99），
+           协方差能提取出真实梯度方向。此阶段与 spikingjelly 的 STE(α=4) 优化的是同一个 mollified 目标。</p>
+      </div>
+      <div class="card b16">
+        <span class="tag">训练后期 · β=16（每 25 epoch ×2）</span>
+        <b>逐步收紧</b>
+        <p>sigmoid 变陡，景观逼近阶跃；裕度定理（定理 3.3）保证权重被推向
+           「阈前电位远离阈值」的区域——为二值化做准备。实测 ep75–100 段斜率最快（+1.6pp/25ep）。</p>
+      </div>
+      <div class="card binf">
+        <span class="tag">部署 · β=∞（硬脉冲）</span>
+        <b>恢复原 SDT 计算图</b>
+        <p>q/k/v 回到 LIF 输出的 0/1 二值张量：注意力退化为掩码式加法（无乘法）。
+           验证始终走硬前向——v4 的 best_val=17.10% 本身就是二值模型测得的，硬化零损失。</p>
+      </div>
+    </div>
+  </section>
+
+  <!-- ================= 演示 1 ================= -->
+  <section>
+    <h2>二、单神经元读出：拖动两个滑块</h2>
+    <p class="note">横轴 = 膜电位与阈值之差 (h−θ)。黑虚线 = 硬脉冲 Heaviside（部署语义）；
+       彩线 = 松弛读出 σ(β(h−θ))（训练语义）。竖线 = 当前神经元的 h−θ。</p>
+    <div class="panel">
+      <canvas id="c1" height="300"></canvas>
+      <div class="ctrl">
+        <label>β（温度倒数）</label>
+        <input type="range" id="s_beta" min="1" max="30" value="4" step="0.5">
+        <label>h−θ</label>
+        <input type="range" id="s_h" min="-400" max="400" value="60">
+        <span class="val" id="v1"></span>
+      </div>
+      <div class="readout" id="r1"></div>
+    </div>
+  </section>
+
+  <!-- ================= 演示 2 ================= -->
+  <section>
+    <h2>三、为什么 σ(β(h−θ)) 就是"二值 + 噪声"：阈值噪声采样实验</h2>
+    <p class="note">给硬脉冲神经元的阈值加独立噪声 ξ ~ Logistic(0, 1/β)（模拟膜电位热噪声），
+       重复发放判定「h+ξ 是否 ≥ θ」。点击采样：绿点 = 发放，红点 = 抑制。
+       经验发放频率会收敛到 σ(β(h−θ))——这就是定理 3.1 的"精确期望"（非近似）。</p>
+    <div class="panel">
+      <canvas id="c2" height="300"></canvas>
+      <div class="ctrl">
+        <label>h−θ</label>
+        <input type="range" id="s_h2" min="-300" max="300" value="120">
+        <label>β</label>
+        <input type="range" id="s_beta2" min="2" max="20" value="8" step="1">
+        <span class="val" id="v2s">已采样 0 次</span>
+        <button id="btn2">采样 200 次</button>
+        <button id="btn2r">重置</button>
+      </div>
+      <div class="readout" id="r2"></div>
+    </div>
+  </section>
+
+  <!-- ================= 演示 3 ================= -->
+  <section>
+    <h2>四、为什么训练期必须连续：fitness 景观对比</h2>
+    <p class="note">横轴 = 沿某个权重方向的位置。硬脉冲网络的 fitness 是<b>阶梯函数</b>：
+       胞内平坦（发放模式不变 ⇒ fitness 不变，ES 无信号），界面处 O(1) 随机跳变（噪声）。
+       松弛网络是<b>平滑曲线</b>：处处有斜率，ES 的协方差估计才有意义。
+       移动的点演示 ES 沿估计方向更新时两种景观下的行为。</p>
+    <div class="panel">
+      <canvas id="c3" height="300"></canvas>
+      <div class="ctrl">
+        <label>松弛尺度 β</label>
+        <input type="range" id="s_beta3" min="2" max="24" value="4" step="1">
+        <button id="btn3">▶ 播放 ES 更新</button>
+        <span class="val" id="v3"></span>
+      </div>
+      <div class="readout" id="r3"></div>
+    </div>
+  </section>
+
+  <!-- ================= 流水线 ================= -->
+  <section>
+    <h2>五、两条前向流水线（只有 LIF 读出不同）</h2>
+    <div class="pipe">
+      <div class="col">
+        <h3>训练期（每 generation，松弛前向）</h3>
+        <div class="step"><div class="box">输入 x</div><div class="arr">→</div><div class="box">SPS 冻结卷积</div></div>
+        <div class="step"><div class="box">Wq/Wk/Wv 卷积</div><div class="arr">→</div><div class="box hl">LIF 松弛读出 σ(β(h−θ))</div></div>
+        <div class="step"><div class="box hl">乘性注意力（连续值）</div><div class="arr">→</div><div class="box">MLP（同样松弛）</div></div>
+        <div class="step"><div class="box">logits → fitness = loglik</div><div class="arr">→</div><div class="box">ES 协方差 ĝ（有信号 ✓）</div></div>
+        <div class="step"><div class="box">AdamW 更新</div><div class="arr">→</div><div class="box">β ← 2β（每 25 epoch）</div></div>
+      </div>
+      <div class="col">
+        <h3>部署期（验证/推理，硬脉冲前向）</h3>
+        <div class="step"><div class="box">输入 x</div><div class="arr">→</div><div class="box">SPS 冻结卷积</div></div>
+        <div class="step"><div class="box">Wq/Wk/Wv 卷积</div><div class="arr">→</div><div class="box hlb">LIF 硬读出 1[mem≥θ] ∈ {0,1}</div></div>
+        <div class="step"><div class="box hlb">二值脉冲注意力（掩码加法，无乘法）</div><div class="arr">→</div><div class="box hlb">MLP（二值）</div></div>
+        <div class="step"><div class="box">logits → 预测</div></div>
+        <div class="step"><div class="box" style="border-color:var(--gold); color:var(--gold);">v4 的 val_top1 = 17.10% 全部由本图测得</div></div>
+      </div>
+    </div>
+    <div class="bridge">桥接：β 退火 ⇒ 松弛前向与硬前向逐点距离 ≤ Σ e^(−β·margin)（裕度定理）⇒ 训练结束切换无损</div>
+  </section>
+
+  <!-- ================= 真实数字 ================= -->
+  <section>
+    <h2>六、真实数字（rust 全尺度，8000 子集 / 100 epoch / 同种子）</h2>
+    <table>
+      <tr><th>方案</th><th>训练期前向</th><th>val best</th><th>val 终点</th><th>尾部</th></tr>
+      <tr><td>v2 硬脉冲 ES</td><td>二值</td><td>16.65%（ep63）</td><td>15.80%</td><td>衰减 −0.85pp</td></tr>
+      <tr><td><b>v4 TSES+退火</b></td><td>σ(β(h−θ))，β 4→16</td><td class="win">17.10%（ep100）</td><td class="win">17.10%</td><td class="win">终点=峰值，仍上升</td></tr>
+      <tr><td>SGD-STE（参照）</td><td>二值（反向代理）</td><td>65.55%（25600 updates）</td><td>—</td><td>—</td></tr>
+    </table>
+    <p class="note" style="margin-top:10px;">
+      v2 的衰减 = ES 在平板流形上注入接口跳变噪声的随机游走；v4 无衰减 = 信号通道恢复（定理 3 的机制预测在全尺度复现）。
+      数学细节见 <code>rust-sdt/ES_MANIFOLD_NOTE.md</code>；数值验证 <code>scripts/verify_es_math.py</code>（一致性 |cos|→0.99）。
+    </p>
+  </section>
+
+  <footer>TSES = Temperature-relaxed Spike ES · rust-sdt · 定理与推导见 ES_MANIFOLD_NOTE.md</footer>
+</main>
+
+<script>
+"use strict";
+const HARD = "#ff8a65", RELAX = "#69f0ae", DIM = "#9aa7bd", GRID = "#2a3550", GOLD = "#ffd54f";
+
+function sig(x, beta){ return 1/(1+Math.exp(-beta*x)); }
+
+function setupCanvas(id){
+  const cv = document.getElementById(id);
+  const dpr = window.devicePixelRatio || 1;
+  const w = cv.clientWidth, h = parseInt(cv.getAttribute("height"));
+  cv.width = w*dpr; cv.height = h*dpr;
+  cv.style.height = h+"px";
+  const ctx = cv.getContext("2d");
+  ctx.setTransform(dpr,0,0,dpr,0,0);
+  return {cv, ctx, w, h};
+}
+function axes(ctx,w,h,x0,x1,y0,y1){
+  ctx.clearRect(0,0,w,h);
+  ctx.strokeStyle = GRID; ctx.lineWidth = 1;
+  ctx.beginPath();
+  for(let gy=0.25; gy<1.0; gy+=0.25){
+    const yy = h-(gy*(y1-y0)+y0)/(y1-y0)*h;
+    ctx.moveTo(0,yy); ctx.lineTo(w,yy);
+  }
+  ctx.stroke();
+  // 零轴（h=θ）
+  const zx = (0-x0)/(x1-x0)*w;
+  ctx.strokeStyle = "#3a4a6e"; ctx.setLineDash([4,4]);
+  ctx.beginPath(); ctx.moveTo(zx,0); ctx.lineTo(zx,h); ctx.stroke();
+  ctx.setLineDash([]);
+}
+function toX(x,x0,x1,w){ return (x-x0)/(x1-x0)*w; }
+function toY(y,y0,y1,h){ return h-(y-y0)/(y1-y0)*h; }
+
+/* ============ 演示 1 ============ */
+const d1 = setupCanvas("c1");
+function draw1(){
+  const {ctx,w,h} = d1;
+  const beta = parseFloat(document.getElementById("s_beta").value);
+  const hv = parseFloat(document.getElementById("s_h").value)/100;
+  const X0=-4,X1=4,Y0=-0.1,Y1=1.15;
+  axes(ctx,w,h,X0,X1,Y0,Y1);
+  // Heaviside
+  ctx.strokeStyle = HARD; ctx.lineWidth = 2.5; ctx.setLineDash([7,5]);
+  ctx.beginPath();
+  ctx.moveTo(toX(X0,X0,X1,w), toY(0,Y0,Y1,h));
+  ctx.lineTo(toX(0,X0,X1,w), toY(0,Y0,Y1,h));
+  ctx.lineTo(toX(0,X0,X1,w), toY(1,Y0,Y1,h));
+  ctx.lineTo(toX(X1,X0,X1,w), toY(1,Y0,Y1,h));
+  ctx.stroke(); ctx.setLineDash([]);
+  // sigmoid(beta)
+  ctx.strokeStyle = RELAX; ctx.lineWidth = 3;
+  ctx.beginPath();
+  for(let px=0; px<=w; px+=2){
+    const x = X0 + px/w*(X1-X0);
+    const y = sig(x,beta);
+    if(px===0) ctx.moveTo(px, toY(y,Y0,Y1,h)); else ctx.lineTo(px, toY(y,Y0,Y1,h));
+  }
+  ctx.stroke();
+  // 当前 h 竖线
+  const hx = toX(hv,X0,X1,w);
+  ctx.strokeStyle = GOLD; ctx.lineWidth = 1.6;
+  ctx.beginPath(); ctx.moveTo(hx,0); ctx.lineTo(hx,h); ctx.stroke();
+  ctx.fillStyle = GOLD;
+  ctx.beginPath(); ctx.arc(hx, toY(sig(hv,beta),Y0,Y1,h), 5, 0, 7); ctx.fill();
+  ctx.fillStyle = HARD;
+  ctx.beginPath(); ctx.arc(hx, toY(hv>=0?1:0,Y0,Y1,h), 5, 0, 7); ctx.fill();
+  // 轴标注
+  ctx.fillStyle = DIM; ctx.font = "12px Consolas";
+  ctx.fillText("h−θ →", w-52, h-8);
+  ctx.fillText("1", 6, toY(1,Y0,Y1,h)+4); ctx.fillText("0", 6, toY(0,Y0,Y1,h)+4);
+  document.getElementById("v1").textContent = "β="+beta.toFixed(1);
+  document.getElementById("r1").innerHTML =
+    '该神经元：硬读出（部署）= <span class="hard">'+(hv>=0?1:0)+'</span>　　'+
+    '松弛读出（训练）= <span class="relax">'+sig(hv,beta).toFixed(4)+'</span>';
+}
+["s_beta","s_h"].forEach(id=>document.getElementById(id).addEventListener("input",draw1));
+
+/* ============ 演示 2 ============ */
+const d2 = setupCanvas("c2");
+let n2=0, fire2=0;
+function logisticSample(beta){
+  const u = Math.random();
+  return Math.log(u/(1-u))/beta;
+}
+function draw2(samples){
+  const {ctx,w,h} = d2;
+  const hv = parseFloat(document.getElementById("s_h2").value)/100;
+  const beta = parseFloat(document.getElementById("s_beta2").value);
+  const X0=-5,X1=5,Y0=0,Y1=1;
+  axes(ctx,w,h,X0,X1,Y0,Y1);
+  // 上半：σ 曲线 + h 位置
+  ctx.strokeStyle = RELAX; ctx.lineWidth = 2.5;
+  ctx.beginPath();
+  for(let px=0; px<=w; px+=2){
+    const x = X0+px/w*(X1-X0);
+    const y = sig(x,beta);
+    if(px===0) ctx.moveTo(px,toY(y,Y0,Y1,h*0.72)); else ctx.lineTo(px,toY(y,Y0,Y1,h*0.72));
+  }
+  ctx.stroke();
+  const hx = toX(hv,X0,X1,w);
+  ctx.strokeStyle = GOLD; ctx.beginPath(); ctx.moveTo(hx,0); ctx.lineTo(hx,h*0.72); ctx.stroke();
+  ctx.fillStyle = DIM; ctx.font="12px Consolas";
+  ctx.fillText("σ(β(h−θ)) = "+sig(hv,beta).toFixed(4)+"（理论发放概率）", 10, 18);
+  ctx.fillText("θ=0 处的阈值 + Logistic(0,1/β) 噪声", 10, 36);
+  // 下半：采样点雨 + 频率条
+  const yBase = h*0.80, yTop = h*0.98;
+  ctx.strokeStyle = GRID; ctx.beginPath(); ctx.moveTo(0,yBase); ctx.lineTo(w,yBase); ctx.stroke();
+  for(const s of samples){
+    const pos = toX(hv + s, X0, X1, w);
+    const ok = (hv + s) >= 0;
+    ctx.fillStyle = ok ? "rgba(105,240,174,0.85)" : "rgba(255,138,101,0.7)";
+    ctx.beginPath();
+    ctx.arc(pos, yBase - Math.random()*(yBase-yTop), 2.6, 0, 7);
+    ctx.fill();
+  }
+  // 频率指示
+  const freq = n2 ? fire2/n2 : 0;
+  ctx.fillStyle = RELAX;
+  ctx.fillRect(10, yBase-6, Math.min(freq,1)*(w-20), 4);
+  document.getElementById("v2s").textContent = "已采样 "+n2+" 次";
+  document.getElementById("r2").innerHTML =
+    '经验发放频率 = <span class="relax">'+freq.toFixed(4)+'</span>（'+fire2+'/'+n2+'）　　'+
+    '理论 σ(β(h−θ)) = <span class="relax">'+sig(hv,beta).toFixed(4)+'</span>　'+
+    '<span style="color:'+DIM+'">差距 '+(n2?Math.abs(freq-sig(hv,beta)).toFixed(4):"—")+'</span>';
+}
+document.getElementById("btn2").addEventListener("click", ()=>{
+  const beta = parseFloat(document.getElementById("s_beta2").value);
+  let i=0;
+  const tick = ()=>{
+    const batch = [];
+    for(let k=0;k<10;k++){
+      const s = logisticSample(beta);
+      n2++; if(parseFloat(document.getElementById("s_h2").value)/100 + s >= 0) fire2++;
+      batch.push(s);
+    }
+    draw2(batch);
+    if(++i<20) requestAnimationFrame(tick);
+  };
+  tick();
+});
+document.getElementById("btn2r").addEventListener("click", ()=>{ n2=0; fire2=0; draw2([]); });
+["s_h2","s_beta2"].forEach(id=>document.getElementById(id).addEventListener("input",()=>{draw2([]);}));
+
+/* ============ 演示 3 ============ */
+const d3 = setupCanvas("c3");
+const jumps = [
+  {x:-2.3, J: 0.9}, {x:-1.1, J:-1.3}, {x: 0.1, J: 0.6},
+  {x: 1.2, J:-1.0}, {x: 2.2, J: 1.2}
+];
+let playing3 = false, pos3 = -2.9;
+function hardFit(x){ let f=0; for(const j of jumps) if(x>=j.x) f+=j.J; return f; }
+function smoothFit(x, beta){
+  // 阶梯的 sigmoid 卷积近似：Σ J_i·σ(β(x−x_i)) —— 与高斯 mollifier 同族
+  let f=0; for(const j of jumps) f += j.J*sig(x-j.x, beta);
+  return f;
+}
+function draw3(marker){
+  const {ctx,w,h} = d3;
+  const beta = parseFloat(document.getElementById("s_beta3").value);
+  const X0=-3,X1=3;
+  let ymin=Infinity,ymax=-Infinity;
+  for(let px=0;px<=w;px+=2){
+    const x=X0+px/w*(X1-X0); const f=hardFit(x);
+    ymin=Math.min(ymin,f); ymax=Math.max(ymax,f);
+  }
+  const pad=(ymax-ymin)*0.18, Y0=ymin-pad, Y1=ymax+pad;
+  axes(ctx,w,h,X0,X1,Y0,Y1);
+  // 硬：阶梯
+  ctx.strokeStyle = HARD; ctx.lineWidth = 2.5;
+  ctx.beginPath();
+  let prevY = toY(hardFit(X0),Y0,Y1,h);
+  ctx.moveTo(0,prevY);
+  for(const j of jumps){
+    const px = toX(j.x,X0,X1,w);
+    const py = toY(hardFit(j.x+1e-6),Y0,Y1,h);
+    ctx.lineTo(px, prevY); ctx.lineTo(px, py);
+    prevY = py;
+  }
+  ctx.lineTo(w, prevY); ctx.stroke();
+  // 松弛：平滑
+  ctx.strokeStyle = RELAX; ctx.lineWidth = 3;
+  ctx.beginPath();
+  for(let px=0; px<=w; px+=2){
+    const x = X0+px/w*(X1-X0);
+    const y = smoothFit(x,beta);
+    if(px===0) ctx.moveTo(px,toY(y,Y0,Y1,h)); else ctx.lineTo(px,toY(y,Y0,Y1,h));
+  }
+  ctx.stroke();
+  // ES 更新点
+  if(marker!==null){
+    const mx = toX(marker,X0,X1,w);
+    ctx.fillStyle = GOLD;
+    ctx.beginPath(); ctx.arc(mx, toY(hardFit(marker),Y0,Y1,h), 5.5, 0, 7); ctx.fill();
+    ctx.strokeStyle = GOLD; ctx.setLineDash([3,3]);
+    ctx.beginPath(); ctx.arc(mx, toY(smoothFit(marker,beta),Y0,Y1,h), 5.5, 0, 7); ctx.stroke();
+    ctx.setLineDash([]);
+  }
+  ctx.fillStyle = DIM; ctx.font="12px Consolas";
+  ctx.fillText("阶梯 = 硬脉冲 fitness（胞内平坦 + 界面跳变）", 10, 18);
+  ctx.fillText("曲线 = 松弛 fitness σ(β(h−θ)) 卷积（处处有斜率）", 10, 36);
+  if(marker!==null){
+    const gh = hardFit(marker+0.01)-hardFit(marker-0.01);
+    const gr = smoothFit(marker+0.01,beta)-smoothFit(marker-0.01,beta);
+    document.getElementById("r3").innerHTML =
+      '该点局部斜率：硬 = <span class="hard">'+(gh===0?"0（ES 无信号，只能靠界面跳变碰运气）":gh.toFixed(3))+'</span>　　'+
+      '松弛 = <span class="relax">'+gr.toFixed(3)+'</span>';
+  }
+}
+document.getElementById("btn3").addEventListener("click", ()=>{
+  if(playing3){ playing3=false; return; }
+  playing3 = true; pos3 = -2.9;
+  const tick = ()=>{
+    if(!playing3) return;
+    pos3 += 0.006;
+    if(pos3>2.9) pos3=-2.9;
+    draw3(pos3);
+    document.getElementById("v3").textContent = "w = "+pos3.toFixed(2);
+    requestAnimationFrame(tick);
+  };
+  tick();
+});
+document.getElementById("s_beta3").addEventListener("input", ()=>draw3(playing3?pos3:null));
+
+window.addEventListener("resize", ()=>{ draw1(); draw2([]); draw3(playing3?pos3:null); });
+draw1(); draw2([]); draw3(null);
+</script>
+</body>
+</html>
