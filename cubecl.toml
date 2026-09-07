@@ -1,0 +1,7 @@
+# CubeCL 运行时配置（显存排查用；排查完毕后 level 应改回 "disabled"）
+[memory.logger]
+level = "full"
+file = "artifacts/cubecl_memory.log"
+append = false
+stdout = false
+stderr = false

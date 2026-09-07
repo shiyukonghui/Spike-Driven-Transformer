@@ -6,7 +6,7 @@ description = "Spike-Driven Transformer 的 Rust + Burn 实现（用于与 PyTor
 
 [dependencies]
 # burn 深度学习框架（wgpu 后端支持 GPU；ndarray 后端用于 CI/调试；autodiff 提供训练用自动微分后端包装）
-burn = { version = "0.18.0", features = ["wgpu", "ndarray", "autodiff"] }
+burn = { version = "0.21.0", features = ["wgpu", "ndarray", "autodiff"] }
 # zip 容器（NPZ 读取）
 zip = { version = "0.6", default-features = false, features = ["deflate"] }
 ndarray = "0.15"

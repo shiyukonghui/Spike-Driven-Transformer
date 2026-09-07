@@ -67,6 +67,59 @@ Result and explainability:
 
 ![The Attention Map of Spike-Driven Transformer in ImageNet.](./imgs/Fig_3_attention_map.png)
 
+## Rust + Burn 迁移（rust-sdt/）
+
+将本项目的 SDT 模型迁移到 Rust + Burn 0.21.0（wgpu GPU 后端），并与 PyTorch 基准做训练结果对照，
+验收标准（2026-09-08 更新）：100 epoch 训练后，最终 val top-1 相对差 ≤ 5%（分母=pytorch 值）
+且 train loss 绝对差 ≤ 0.1 判 PASS。当前状态：**PASS**（top1 相对差 0.15%、loss 绝对差 0.031）。
+
+### 目录结构
+
+```
+├── rust-sdt/                 # Rust 实现（Burn）
+│   ├── src/                  # model/ops/train/loader/check/config/tensor_io
+│   ├── artifacts/            # 权重、数据、报告、CSV（sdt_reference.npz / cifar10_data.npz / forward_report.txt / train_report.txt / *.csv）
+│   └── probe_vram.ps1        # VRAM 轮询探测脚本
+├── scripts/
+│   ├── export_reference.py       # 导出 PyTorch 权重与中间张量
+│   ├── export_cifar10.py         # 导出 CIFAR-10 子集 npz
+│   └── train_pytorch_reference.py # PyTorch 小规模训练基准
+└── .trae/specs/migrate-sdt-to-burn/ # 迁移 spec / tasks / checklist
+```
+
+### 使用命令（在 rust-sdt/ 下）
+
+```shell
+# 1) 前向逐模块对照（rel_l2<5% 且 max_abs<0.05 判 PASS）
+cargo run --release -- forward-check
+
+# 2) Burn 侧小规模训练（T=4 全程可跑：校准 + 训练 + eval 零 OOM，~21s/epoch）
+cargo run --release -- train --epochs 2
+
+# 3) 训练结果对照（读取 artifacts/train_burn.csv 与 artifacts/train_pytorch.csv）
+cargo run --release -- train-compare
+```
+
+### 当前状态（2026-09-08）
+
+| 项目 | 状态 |
+| --- | --- |
+| 构建（workspace + burn 0.21.0） | 完成 |
+| forward-check 前向对照 | PASS（logits rel_l2=0，与 PyTorch 逐 bit 一致） |
+| PyTorch 基准（train_pytorch.csv） | epoch2: loss 1.8307 / top1 33.95% |
+| burn 0.21 显存问题 | **已修复**（T=4 全程零 OOM，~21s/epoch，0.18 基线 79s/epoch 的 3.8×） |
+| Burn 训练（0.21 + 显存修复） | 100 epoch：ep100 loss 1.8257→0.1289 / top1 65.55%，全程零 OOM |
+| train-compare（100 epoch 对照） | **PASS**（top1 相对差 0.15% ≤5%；loss 绝对差 0.031 ≤0.1；口径见 check_log 七节） |
+
+显存修复摘要（三叠加根因，详见 [rust-sdt/check_log.txt](rust-sdt/check_log.txt)）：
+1. burn-fusion 0.21 延迟 drop（ContinueDrop 不触发 drain）→ 本地补丁恢复 0.18 语义
+   （`patches/burn-fusion`，`BURN_FUSION_CONTINUE_DROP_DRAIN=0` 可关）；
+2. 纯前向路径（eval/校准）autodiff 图节点不释放 → eval 改走内层 wgpu 后端 +
+   校准/eval 逐批 sync+cleanup；
+3. cubecl SlicedPages 池不自动回收 → 保留阶段边界清理。
+诊断设施默认零开销，环境变量门控（`BURN_FUSION_LOG`、`BURN_SDT_POOL_DIAG`、
+`SDT_PROBE_*`、`SDT_BATCH_SYNC`、`SDT_BATCH_CLEANUP`）。
+
 ## Data Prepare
 
 - use `PyTorch` to load the CIFAR10 and CIFAR100 dataset.

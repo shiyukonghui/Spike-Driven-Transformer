@@ -3,3 +3,12 @@
 [workspace]
 members = ["rust-sdt"]
 resolver = "2"
+
+# 本地补丁：burn-fusion 0.21.0 恢复 0.18 的 drop-triggered drain 语义。
+# 根因：0.21 把 `DropAction::ContinueDrop => true`（0.18）改成了 `=> false`，
+# 普通张量 drop 只入队不执行，训练首个 step 内数千个中间张量的 GPU 缓冲
+# 零复用累积（24GB RTX 4090 触顶 OOM）。补丁内容与 A/B 开关见
+# patches/burn-fusion/src/stream/multi.rs。
+[patch.crates-io]
+burn-fusion = { path = "patches/burn-fusion" }
+cubecl-runtime = { path = "patches/cubecl-runtime" }

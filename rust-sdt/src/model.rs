@@ -20,7 +20,8 @@ use crate::ops::{lif_seq, maxpool2d_3x3_s2};
 /// 采用 wgpu 后端（GPU 加速）；对照与数据构造阶段使用 f32
 pub type BackendAdapter = burn::backend::Wgpu;
 /// wgpu 后端的设备类型（张量构造与数据搬运使用）
-pub type Dev = <BackendAdapter as burn::tensor::backend::Backend>::Device;
+/// burn 0.21：Device 关联类型移到 BackendTypes supertrait
+pub type Dev = <BackendAdapter as burn::tensor::backend::BackendTypes>::Device;
 
 /// 单个卷积层的融合权重：[out, in, kH, kW] 与 [out]（泛型后端）
 #[derive(Clone, Debug)]
@@ -362,11 +363,12 @@ pub fn forward_full<B: Backend>(
         + w.head_b.clone().unsqueeze::<2>().unsqueeze::<3>().reshape([1, cfg.num_classes]);
 
     // 时间平均：[T,B,num_classes] -> [B,num_classes]
+    // burn 0.21：squeeze 不再带索引参数（形状由泛型 D2 唯一确定）
     let ld = logits_tb.dims();
     logits_tb
         .reshape([t, b, ld[1]])
         .sum_dim(0)
-        .squeeze::<2>(0)
+        .squeeze::<2>()
         .div_scalar(t as f32)
 }
 

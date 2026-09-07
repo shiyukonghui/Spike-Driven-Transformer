@@ -37,6 +37,21 @@ enum Command {
         #[arg(long, default_value_t = 42)]
         seed: u64,
     },
+    /// 训练结果对照：读取 Burn 与 PyTorch 两份训练 CSV，判定迁移误差是否在允许范围
+    TrainCompare {
+        /// Burn 侧训练指标 CSV
+        #[arg(long, default_value = "artifacts/train_burn.csv")]
+        burn_csv: String,
+        /// PyTorch 基准训练指标 CSV
+        #[arg(long, default_value = "artifacts/train_pytorch.csv")]
+        pytorch_csv: String,
+        /// 最终 val top-1 允许相对偏差（%，分母=pytorch 值）
+        #[arg(long, default_value_t = 5.0)]
+        top1_tol: f64,
+        /// 最终 train loss 允许绝对差
+        #[arg(long, default_value_t = 0.1)]
+        loss_tol: f64,
+    },
     /// 小规模训练对照：Burn 训练数个 epoch，与 PyTorch 同步对照
     Train {
         /// 训练配置名称（对应 config.rs 中的预设）
@@ -67,6 +82,13 @@ enum Command {
         #[arg(long, default_value_t = false)]
         no_calibrate: bool,
     },
+    /// 显存最小复现：反复对 [128,256,8,8]（8MB）张量做 conv+backward+drop，
+    /// 配合 BURN_SDT_POOL_DIAG=1 判断泄漏在栈层还是模型层
+    MemProbe {
+        /// 迭代次数
+        #[arg(long, default_value_t = 300)]
+        iters: u32,
+    },
 }
 
 fn main() {
@@ -74,6 +96,15 @@ fn main() {
     match cli.command {
         Command::ForwardCheck { npz, seed } => {
             crate::check::run_forward_check(&npz, seed);
+        }
+        Command::TrainCompare {
+            burn_csv,
+            pytorch_csv,
+            top1_tol,
+            loss_tol,
+        } => {
+            // 训练结果对照：两份 CSV 各取最后一行比较，写入 train_report.txt
+            crate::train::run_train_compare(&burn_csv, &pytorch_csv, top1_tol, loss_tol);
         }
         Command::Train {
             preset,
@@ -98,6 +129,9 @@ fn main() {
                 time_steps,
                 no_calibrate,
             });
+        }
+        Command::MemProbe { iters } => {
+            crate::train::run_mem_probe(iters);
         }
     }
 }

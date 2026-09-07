@@ -86,5 +86,6 @@ pub fn lif_seq<B: Backend, const D: usize>(x: Tensor<B, D>, threshold: f64) -> T
 /// SPS 中的 maxpool：kernel=3, stride=2, padding=1（ceil_mode=False）。
 /// 输入 [B, C, H, W]，输出 [B, C, (H+2-3)/2+1, ...]（floor 语义与 PyTorch 一致）。
 pub fn maxpool2d_3x3_s2<B: Backend>(x: Tensor<B, 4>) -> Tensor<B, 4> {
-    burn::tensor::module::max_pool2d(x, [3, 3], [2, 2], [1, 1], [1, 1])
+    // burn 0.21：max_pool2d 新增 ceil_mode 参数（false = floor 语义，与 PyTorch 一致）
+    burn::tensor::module::max_pool2d(x, [3, 3], [2, 2], [1, 1], [1, 1], false)
 }

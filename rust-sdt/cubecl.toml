@@ -1,0 +1,6 @@
+﻿[memory.logger]
+level = "disabled"
+file = "artifacts/cubecl_memory.log"
+append = false
+stdout = false
+stderr = false
