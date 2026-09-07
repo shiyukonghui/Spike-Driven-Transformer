@@ -1026,6 +1026,7 @@ struct ChunkFactors {
 /// lora 槽行布局：每候选 (a+b)×r 标准正态（前 b 行=B，后 a 行=A×sign·σ_slot/√r），
 /// 与迁移版 get_lora_update_params 的切分约定一致；反对称对共享随机流。
 #[allow(clippy::too_many_arguments)]
+#[allow(dead_code)] // S3 后 factored 路径改用 gen_chunk_factors_gpu；保留供 cache 模式对照
 fn gen_chunk_flat(
     lora_slots: Vec<FSlotSpec>,
     dense_slots: Vec<FSlotSpec>,
@@ -1136,6 +1137,7 @@ fn gen_chunk_flat(
 }
 
 /// 上传一个 chunk 的 flat 噪声并切分 A/B（主线程执行，~155MB PCIe）
+#[allow(dead_code)] // S3 后 factored 路径不再上传；保留供 cache 模式对照
 fn upload_chunk_factors(
     lora_parts: Vec<Vec<f32>>,
     dense_parts: Vec<Vec<f32>>,
@@ -1175,6 +1177,177 @@ fn upload_chunk_factors(
         lora: lora_out,
         dense: dense_out,
     }
+}
+
+/// S3：GPU 端确定性噪声因子生成（xorshift32 + Box-Muller 全向量化）。
+/// 因子直接在显存构建——零 CPU 生成、零 PCIe 上传（原 ~9.6GB/epoch）。
+/// 语义与 CPU 版一致：候选 g 的 seed = noise_seed(key, epoch, g/2)，
+/// B 区（前 b 行）共享原始法向，A 区（后 a 行）×(sign(g)·σ_slot/√r)，dense ±σ_slot。
+/// 注意：RNG 流值与 CPU 版不同（xorshift32-GPU vs xorshift64-CPU）⇒ 与旧结果对比需重基线。
+fn gen_chunk_factors_gpu(
+    lora_slots: &[FSlotSpec],
+    dense_slots: &[FSlotSpec],
+    sigma_lora: &[f32],
+    sigma_dense: &[f32],
+    rank: usize,
+    cand_slice: &[usize],
+    epoch: i32,
+    device: &Dev,
+) -> ChunkFactors {
+    let c = cand_slice.len();
+    let sign_t = Tensor::<B, 1>::from_floats(
+        cand_slice
+            .iter()
+            .map(|&g| if g % 2 == 0 { 1.0f32 } else { -1.0f32 })
+            .collect::<Vec<f32>>()
+            .as_slice(),
+        device,
+    )
+    .reshape([c, 1]);
+    // 按唯一 count 分组生成（同形状槽共用一次 kernel 链，削减启动数）
+    let mut lora_out = Vec::with_capacity(lora_slots.len());
+    lora_out.resize_with(lora_slots.len(), || {
+        (
+            Tensor::<B, 3>::zeros([1, 1, 1], device),
+            Tensor::<B, 3>::zeros([1, 1, 1], device),
+        )
+    });
+    for (group, sis) in lora_groupby_count(lora_slots, rank) {
+        let l = group;
+        // 种子 [n, c, 1]：n 个槽 × c 候选
+        let mut seeds = Vec::with_capacity(sis.len() * c);
+        for &si in &sis {
+            for &g in cand_slice {
+                let s = noise_seed(lora_slots[si].key, epoch, (g / 2) as i32);
+                seeds.push(((s ^ (s >> 32)) as u32) as i32);
+            }
+        }
+        let n = sis.len();
+        let seed_t = Tensor::<B, 1, Int>::from_data(
+            burn::tensor::TensorData::new(seeds, [n * c]),
+            device,
+        )
+        .reshape([n, c, 1]);
+        let normals = gpu_normals3(seed_t, l, device); // [n, c, l]
+        for (gi, &si) in sis.iter().enumerate() {
+            let [a, b] = lora_slots[si].shape.flat2d();
+            let nm = normals.clone().slice([gi..gi + 1]).reshape([c, l]); // [c, l]
+            // B 区共享原始法向（pair 内不反号）
+            let b_part = nm.clone().narrow(1, 0, b * rank).reshape([c, b, rank]);
+            // A 区 ×(sign·σ/√r)
+            let a_part = nm.narrow(1, b * rank, a * rank).reshape([c, a, rank])
+                * sign_t
+                    .clone()
+                    .reshape([c, 1, 1])
+                    .mul_scalar(sigma_lora[si] / (rank as f32).sqrt());
+            let lora_t = Tensor::cat(vec![b_part, a_part], 1); // [c, a+b, rank]
+            let a_t = lora_t
+                .clone()
+                .slice([0..c, b..(a + b), 0..rank])
+                .swap_dims(1, 2);
+            let b_t = lora_t.slice([0..c, 0..b, 0..rank]).swap_dims(1, 2);
+            lora_out[si] = (a_t, b_t);
+        }
+    }
+    let mut dense_out = Vec::with_capacity(dense_slots.len());
+    dense_out.resize_with(dense_slots.len(), || Tensor::<B, 2>::zeros([1, 1], device));
+    for (group, sis) in dense_groupby_count(dense_slots) {
+        let n_dim = group;
+        let mut seeds = Vec::with_capacity(sis.len() * c);
+        for &si in &sis {
+            for &g in cand_slice {
+                let s = noise_seed(dense_slots[si].key, epoch, (g / 2) as i32);
+                seeds.push(((s ^ (s >> 32)) as u32) as i32);
+            }
+        }
+        let n = sis.len();
+        let seed_t = Tensor::<B, 1, Int>::from_data(
+            burn::tensor::TensorData::new(seeds, [n * c]),
+            device,
+        )
+        .reshape([n, c, 1]);
+        let normals = gpu_normals3(seed_t, n_dim, device); // [n, c, count]
+        for (gi, &si) in sis.iter().enumerate() {
+            let nm = normals.clone().slice([gi..gi + 1]).reshape([c, n_dim]);
+            let d2 = nm * sign_t.clone().mul_scalar(sigma_dense[si]);
+            dense_out[si] = d2;
+        }
+    }
+    ChunkFactors {
+        lora: lora_out,
+        dense: dense_out,
+    }
+}
+
+/// lora 槽按唯一 l=(a+b)·rank 分组（保持槽序）
+fn lora_groupby_count(lora_slots: &[FSlotSpec], rank: usize) -> Vec<(usize, Vec<usize>)> {
+    let mut order: Vec<usize> = Vec::new();
+    let mut groups: Vec<(usize, Vec<usize>)> = Vec::new();
+    for (si, slot) in lora_slots.iter().enumerate() {
+        let [a, b] = slot.shape.flat2d();
+        let l = (a + b) * rank;
+        if let Some(g) = groups.iter_mut().find(|(lg, _)| *lg == l) {
+            g.1.push(si);
+        } else {
+            order.push(l);
+            groups.push((l, vec![si]));
+        }
+    }
+    let _ = order;
+    groups
+}
+
+/// dense 槽按唯一元素数分组（保持槽序）
+fn dense_groupby_count(dense_slots: &[FSlotSpec]) -> Vec<(usize, Vec<usize>)> {
+    let mut groups: Vec<(usize, Vec<usize>)> = Vec::new();
+    for (si, slot) in dense_slots.iter().enumerate() {
+        let n = slot.shape.flat2d()[0] * slot.shape.flat2d()[1];
+        if let Some(g) = groups.iter_mut().find(|(ng, _)| *ng == n) {
+            g.1.push(si);
+        } else {
+            groups.push((n, vec![si]));
+        }
+    }
+    groups
+}
+
+/// [n, c, count] 标准法向（rank-3 批量版）：
+/// state = seed ⊕ fmix32(elem·GOLDEN)（murmur3 充分雪崩，消除 elem 与 elem+half
+/// 的常数 XOR 关联——xorshift 是 GF(2) 线性映射，弱混合会让 Box-Muller 两半
+/// 确定性相关 → 法向分布系统偏差），fmix32 + xorshift32×2，Box-Muller 两半各一组。
+fn gpu_normals3(seed_t: Tensor<B, 3, Int>, count: usize, device: &Dev) -> Tensor<B, 3> {
+    let half_count = count.div_ceil(2);
+    let elem = Tensor::<B, 1, Int>::arange(0..(half_count * 2) as i64, device)
+        .reshape([1, 1, half_count * 2]);
+    // fmix32（murmur3）：h ^= h>>16; h *= 0x21f0aaad; h ^= h>>15; h *= 0x735a2d97; h ^= h>>15
+    let z0 = seed_t
+        .clone()
+        .bitwise_xor(elem.bitwise_xor_scalar((-1640531527i32))); // elem·GOLDEN（u32 黄金率回绕为 i32）
+    let mut z = z0;
+    z = z.clone().bitwise_xor(z.clone().bitwise_right_shift_scalar(16i32));
+    z = z * 0x21F0_AAADi32;
+    z = z.clone().bitwise_xor(z.clone().bitwise_right_shift_scalar(15i32));
+    z = z * 0x735A_2D97i32;
+    z = z.clone().bitwise_xor(z.clone().bitwise_right_shift_scalar(15i32));
+    // xorshift32 ×2
+    z = z.clone().bitwise_xor(z.clone().bitwise_left_shift_scalar(13i32));
+    z = z.clone().bitwise_xor(z.clone().bitwise_right_shift_scalar(17i32));
+    z = z.clone().bitwise_xor(z.clone().bitwise_left_shift_scalar(5i32));
+    z = z.clone().bitwise_xor(z.clone().bitwise_left_shift_scalar(13i32));
+    z = z.clone().bitwise_xor(z.clone().bitwise_right_shift_scalar(17i32));
+    z = z.clone().bitwise_xor(z.clone().bitwise_left_shift_scalar(5i32));
+    let u = z
+        .bitwise_right_shift_scalar(8i32)
+        .bitwise_and_scalar(0x00FF_FFFFi32)
+        .float()
+        .div_scalar(16777216.0); // [0,1)
+    let u1 = u.clone().narrow(2, 0, half_count).clamp(1e-6, 1.0);
+    let u2 = u.narrow(2, half_count, half_count);
+    let r = (u1.log().mul_scalar(-2.0)).sqrt();
+    let two_pi_u2 = u2.mul_scalar(2.0 * std::f32::consts::PI);
+    let n1 = r.clone() * two_pi_u2.clone().cos();
+    let n2 = r * two_pi_u2.sin();
+    Tensor::cat(vec![n1, n2], 2).narrow(2, 0, count)
 }
 
 /// 因式分解噪声的 1×1 卷积（批量候选并行，完全复刻迁移版 nn() 语义）。
@@ -1531,38 +1704,22 @@ pub fn run_train_es_factored(args: EsArgs) {
         let mut gen_time = 0.0_f32;
         let mut fwd_time = 0.0_f32;
         let n_chunks = args.pop / args.chunk;
-        // 流水线：CPU 生成下一 chunk 噪声 与 GPU 前向重叠
         let order_vec: Vec<usize> = order.to_vec();
-        let spawn_prefetch = |k: usize| -> std::thread::JoinHandle<(Vec<Vec<f32>>, Vec<Vec<f32>>)> {
-            let ls = lora_slots.clone();
-            let ds = dense_slots.clone();
-            let sl = sigma_lora.clone();
-            let sd = sigma_dense.clone();
-            let ov = order_vec.clone();
-            let rank = args.rank;
-            let chunk = args.chunk;
-            let ep = epoch as i32;
-            std::thread::spawn(move || gen_chunk_flat(ls, ds, sl, sd, rank, ov[k * chunk..(k + 1) * chunk].to_vec(), ep))
-        };
-        let mut prefetch = if n_chunks > 0 { Some(spawn_prefetch(0)) } else { None };
         for k in 0..n_chunks {
-            // ---- 1) 等待/启动 CPU 噪声生成（与上一 chunk 的 GPU 前向重叠）----
+            // ---- 1) S3：GPU 端因子生成（零 CPU 生成、零 PCIe 上传）----
             let t0 = std::time::Instant::now();
-            let (flat_l, flat_d) = prefetch.take().expect("prefetch 缺失").join().unwrap();
-            gen_time += t0.elapsed().as_secs_f32();
-            if k + 1 < n_chunks {
-                prefetch = Some(spawn_prefetch(k + 1));
-            }
             let cand_slice: Vec<usize> = order_vec[k * args.chunk..(k + 1) * args.chunk].to_vec();
-            let factors = upload_chunk_factors(
-                flat_l,
-                flat_d,
+            let factors = gen_chunk_factors_gpu(
                 &lora_slots,
                 &dense_slots,
+                &sigma_lora,
+                &sigma_dense,
                 args.rank,
-                cand_slice.len(),
+                &cand_slice,
+                epoch as i32,
                 device,
             );
+            gen_time += t0.elapsed().as_secs_f32();
 
             // ---- 2) 因式噪声前向 + fitness ----
             let t1 = std::time::Instant::now();
