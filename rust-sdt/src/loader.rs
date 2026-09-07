@@ -105,6 +105,29 @@ impl Cifar10Npz {
     ///
     /// `indices` 中的每个索引必须 < 对应划分的样本数。
     /// 泛型后端：训练时以 autodiff 后端调用（与 autodiff 权重匹配），
+    /// S2 优化：暴露扁平像素表与标签（供 GPU 端预载 + index 行选择）。
+    pub fn pixels_flat(&self, split: Split) -> &[f32] {
+        match split {
+            Split::Train => &self.train_x,
+            Split::Test => &self.test_x,
+        }
+    }
+
+    pub fn labels_i64(&self, split: Split) -> &[i64] {
+        match split {
+            Split::Train => &self.train_y,
+            Split::Test => &self.test_y,
+        }
+    }
+
+    /// 组装一个批次张量。
+    ///
+    /// 返回值：
+    /// - 图像 [T, B, 3, 32, 32]（Float）：T 个时间步均为同一静态帧（reshape 复制）
+    /// - 标签 [B]（Int）：供 burn 0.18 的 `CrossEntropyLoss::forward` 直接使用
+    ///
+    /// `indices` 中的每个索引必须 < 对应划分的样本数。
+    /// 泛型后端：训练时以 autodiff 后端调用（与 autodiff 权重匹配），
     /// 校准/静态统计时以 wgpu 后端调用；设备同型，张量构造路径一致。
     pub fn get_batch<B: Backend>(
         &self,

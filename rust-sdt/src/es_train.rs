@@ -1468,6 +1468,22 @@ pub fn run_train_es_factored(args: EsArgs) {
     }
     let mut optim = AdamW::new(&all_shapes, args.lr as f32, 1e-4, device);
 
+    // S2 优化：训练集一次性预载显存（8000×3072×4B ≈ 98MB），chunk 批次改为
+    // GPU 端 one-hot matmul 行选择（0/1 矩阵乘在 f32 下逐位精确 = 行拷贝，
+    // ~6GFLOP/chunk 可忽略），删除 62 次/epoch 的 CPU gather + 图像 PCIe 上传。
+    let frame = crate::loader::C * crate::loader::H * crate::loader::W;
+    let pix_t = Tensor::<B, 1>::from_floats(data.pixels_flat(Split::Train), device)
+        .reshape([data.n_train, frame]); // [N, 3072]
+    let lab_t = Tensor::<B, 1, Int>::from_data(
+        burn::tensor::TensorData::new(
+            data.labels_i64(Split::Train).to_vec(),
+            [data.n_train],
+        ),
+        device,
+    );
+    let ar_t = Tensor::<B, 1, Int>::arange(0..data.n_train as i64, device)
+        .reshape([1, data.n_train]);
+
     // CSV
     let mut csv_rows: Vec<String> =
         vec!["epoch,train_top1,train_loglik,val_top1,best_val,epoch_time,cum_time".to_string()];
@@ -1550,8 +1566,21 @@ pub fn run_train_es_factored(args: EsArgs) {
 
             // ---- 2) 因式噪声前向 + fitness ----
             let t1 = std::time::Instant::now();
-            let (images, targets) =
-                data.get_batch(Split::Train, &cand_slice, args.time_steps, device);
+            // S2：GPU 行选择替代 get_batch（语义与 [T,B,3,32,32] 逐位一致）
+            let idx_t = Tensor::<B, 1, Int>::from_data(
+                burn::tensor::TensorData::new(
+                    cand_slice.iter().map(|&i| i as i64).collect::<Vec<i64>>(),
+                    [cand_slice.len()],
+                ),
+                device,
+            );
+            let onehot = idx_t.clone().reshape([cand_slice.len(), 1]).equal(ar_t.clone()).float(); // [C,N]
+            let sel = onehot.matmul(pix_t.clone()); // [C, 3072]（f32 精确行拷贝）
+            let images = sel
+                .reshape([cand_slice.len(), 3, 32, 32])
+                .reshape([1, cand_slice.len(), 3, 32, 32])
+                .repeat_dim(0, args.time_steps); // [T, C, 3, 32, 32]
+            let targets = lab_t.clone().select(0, idx_t); // [C] Int
             let logits = es_forward_factored(images, &base, &factors, &cfg, args.relax, beta_t); // [C, 10]
             let logsm = log_softmax2(logits.clone());
             let onehot = one_hot(&data.train_y, &cand_slice, cfg.num_classes, device);
