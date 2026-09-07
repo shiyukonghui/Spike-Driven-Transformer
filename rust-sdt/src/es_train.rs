@@ -1583,8 +1583,10 @@ pub fn run_train_es_factored(args: EsArgs) {
             let targets = lab_t.clone().select(0, idx_t); // [C] Int
             let logits = es_forward_factored(images, &base, &factors, &cfg, args.relax, beta_t); // [C, 10]
             let logsm = log_softmax2(logits.clone());
-            let onehot = one_hot(&data.train_y, &cand_slice, cfg.num_classes, device);
-            let raw = (logsm * onehot).sum_dim(1).reshape([cand_slice.len()]); // [C]
+            // S7 优化：one_hot 构造+乘法 → gather（raw[c] = logsm[c, targets[c]]，逐位一致）
+            let raw = logsm
+                .gather(1, targets.clone().reshape([cand_slice.len(), 1]))
+                .reshape([cand_slice.len()]); // [C]
             let pred = logits.argmax(1).reshape([cand_slice.len()]);
             correct_acc = correct_acc.clone() + pred.equal(targets).float().sum();
             n_used += cand_slice.len();
@@ -1639,7 +1641,7 @@ pub fn run_train_es_factored(args: EsArgs) {
         // ---- 6) 验证 ----
         let mut val_str = String::new();
         if epoch % args.validate_every == 0 || epoch == args.epochs - 1 {
-            let val_top1 = eval_es(&base, &data, 64, args.time_steps, &cfg);
+            let val_top1 = eval_es(&base, &data, 256, args.time_steps, &cfg); // S9：批 64→256
             if val_top1 > best_val {
                 best_val = val_top1;
             }
