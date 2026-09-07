@@ -1853,7 +1853,7 @@ pub fn run_train_es_factored(args: EsArgs) {
                 "epoch={}/{}, train_top1={:.2}%, train_loglik={:.4}, val_top1={:.2}%, best_val={:.2}%{}（gen {:.1}s fwd {:.1}s，本轮 {:.1}s，lr={:.5}）",
                 epoch + 1, args.epochs, train_top1, train_loglik, val_top1, best_val,
                 if args.relax {
-                    if args.relax && beta_t < 16.0 {
+                    if args.relax && (beta_t < 16.0 || !args.hard_at_16) {
                         format!(" β={beta_t:.1}(松弛前向)")
                     } else {
                         format!(" β={beta_t:.1}(硬前向)")
