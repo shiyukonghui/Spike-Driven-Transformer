@@ -612,6 +612,8 @@ pub struct EsArgs {
     pub lr_warmup: u32,
     /// 可变学习率：余弦退火终值比例（lr_min = lr × lr_min_frac）
     pub lr_min_frac: f64,
+    /// S4（opt-in）：β≥16 时训练 fitness 切硬 LIF（Run-1 实测长跑为负优化，默认关）
+    pub hard_at_16: bool,
 }
 
 /// 内层 wgpu 设备引用
@@ -1776,10 +1778,11 @@ pub fn run_train_es_factored(args: EsArgs) {
                 .reshape([1, cand_slice.len(), 3, 32, 32])
                 .repeat_dim(0, args.time_steps); // [T, C, 3, 32, 32]
             let targets = lab_t.clone().select(0, idx_t); // [C] Int
-            // S4 优化：β 退火到 16 后切硬 LIF（σ(16·(h−θ)) 与阶跃的 EMA 差 <0.5%，
-            // 松弛前向的 sigmoid/乘加不再有信息量）
+            // S4 优化：β 退火到 16 后切硬 LIF——Run-1（1000ep）实测为训练质量负优化
+            // （峰值后衰减回归，机制 = 定理 2/3：硬 fitness 信号只在切换复形上），
+            // 故改为 opt-in：默认全程松弛（v4 行为），--hard-at-16 启用硬切换。
             // S6：relax-scope=ssa 时 MLP/head 位点保持硬 LIF
-            let relax_fwd = args.relax && beta_t < 16.0;
+            let relax_fwd = args.relax && (beta_t < 16.0 || !args.hard_at_16);
             let relax_mlp = relax_fwd && args.relax_scope != "ssa";
             let logits = es_forward_factored(images, &base, &factors, &cfg, relax_fwd, relax_mlp, beta_t); // [C, 10]
             let logsm = log_softmax2(logits.clone());

@@ -156,6 +156,9 @@ enum Command {
         /// 可变学习率：余弦退火终值比例（lr_min = lr × 此值）
         #[arg(long, default_value_t = 0.0)]
         lr_min_frac: f64,
+        /// S4（opt-in）：β≥16 时训练 fitness 切硬 LIF（默认关：全程松弛）
+        #[arg(long, default_value_t = false)]
+        hard_at_16: bool,
     },
 }
 
@@ -223,6 +226,7 @@ fn main() {
             relax_scope,
             lr_warmup,
             lr_min_frac,
+            hard_at_16,
         } => {
             crate::es_train::run_train_es(crate::es_train::EsArgs {
                 epochs,
@@ -246,6 +250,7 @@ fn main() {
                 relax_scope,
                 lr_warmup,
                 lr_min_frac,
+                hard_at_16,
             });
         }
     }
