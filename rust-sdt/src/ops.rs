@@ -73,15 +73,16 @@ pub fn lif_seq<B: Backend, const D: usize>(x: Tensor<B, D>, threshold: f64) -> T
     let t = x.dims()[0];
     // 初始膜电位：[1, ...] 形状（与单个时间步切片同形）
     let mut v = Tensor::zeros(x.clone().slice([0..1]).shape(), &x.device());
-    let mut spikes: Vec<Tensor<B, D>> = Vec::with_capacity(t);
+    // S8 优化：预分配输出 + slice_assign 逐步写回（替代 Vec 收集 + cat）
+    let mut out = Tensor::zeros(x.shape(), &x.device());
     for i in 0..t {
         // 取第 i 个时间步：[1, ...]
         let xt = x.clone().slice([i..i + 1]);
         let (spike, v_new) = lif_step(v, xt, threshold);
         v = v_new;
-        spikes.push(spike);
+        out = out.slice_assign([i..i + 1], spike);
     }
-    Tensor::cat(spikes, 0)
+    out
 }
 
 /// 温度松弛 LIF 单步（TSES，ES_MANIFOLD_NOTE.md 定理 3.1/3.2）：
@@ -108,14 +109,14 @@ pub fn lif_seq_relaxed<B: Backend, const D: usize>(
 ) -> Tensor<B, D> {
     let t = x.dims()[0];
     let mut v = Tensor::zeros(x.clone().slice([0..1]).shape(), &x.device());
-    let mut outs: Vec<Tensor<B, D>> = Vec::with_capacity(t);
+    let mut out = Tensor::zeros(x.shape(), &x.device());
     for i in 0..t {
         let xt = x.clone().slice([i..i + 1]);
         let (s, v_new) = lif_step_relaxed(v, xt, threshold, beta);
         v = v_new;
-        outs.push(s);
+        out = out.slice_assign([i..i + 1], s);
     }
-    Tensor::cat(outs, 0)
+    out
 }
 /// SPS 中的 maxpool：kernel=3, stride=2, padding=1（ceil_mode=False）。
 /// 输入 [B, C, H, W]，输出 [B, C, (H+2-3)/2+1, ...]（floor 语义与 PyTorch 一致）。
