@@ -243,3 +243,40 @@ LIF(1.0)/LIF(0.5)）+ LIF head，T=2，d=32，~9 万参数，静态校准 mem st
 β=16 段（ep75-100）+1.6pp/25ep 为全程最快段。峰值幅度 +0.45pp 符合定理 2.4
 （预算约束仍在）——下一步是混合估计器（SGD 管平滑权重 / ES 管 v_th/β），
 而非继续调 ES 超参。
+
+---
+
+## 11. 全链路软件优化 + 1000 epoch 可变学习率验证（2026-09-09，check_log 十二节）
+
+数学结论（§1-§10）不动，本节记录把「每 epoch 成本」压下来的工程项与终局验证。
+优化节点逐项 git 提交（main 9e678ee…b65a252），每节点 10ep A/B 或逐位一致性验证：
+
+| 节点 | 内容 | 实测 |
+|---|---|---|
+| S1 | raw 统计/正确数全程 GPU 累积（删 124 次 into_scalar 同步） | fwd 13.7→6.1s |
+| S2 | 训练集预载显存 + GPU one-hot matmul 行选择（f32 逐位精确） | fwd 6.1→5.3s |
+| S7 | fitness 改 gather（去 one_hot 构造+乘法） | 与乘法 1ulp 一致 |
+| S9 | eval batch 64→256 | eval 加速 |
+| S8 | lif_seq 预分配 + slice_assign 写回（去 Vec+cat） | 数值一致 |
+| M2 | 同图反对称对（中心差分）——**10ep A/B 11.45% vs 9.95%，回退** | 覆盖度 > 配对方差 |
+| S3 | 噪声因子 GPU 端生成（xorshift32+Box-Muller 全向量化） | fwd 5.3→2.7s |
+| S4 | β≥16 训练 fitness 切硬 LIF | σ(16·)≈阶跃 |
+| S6 | --relax-scope ssa\|all 松弛作用域选项 | 默认 all=v4 |
+| LR | 线性 warmup + 余弦退火（--lr-warmup / --lr-min-frac） | 1000ep 用 25/0.1 |
+
+S3 的关键教训：xorshift 是 GF(2) 线性映射，弱 elem 混合（elem 与 elem+half 仅差
+常数 XOR）使 Box-Muller 两半确定性相关 → 法向分布系统偏差 → fitness 崩至 −10。
+修复 = murmur3 fmix32 雪崩；numpy 逐位复刻验证。**数学指导的结论再一次成立：
+伪随机流的「独立性」是估计器的生命线，混合不足的流等价于有偏采样。**
+
+M2 负结果的理论解释：同图反对称对把 pair 差分的图像难度噪声（±2-4 nats）消除，
+方差严格下降——但同时把每更新的独立图像覆盖从 8000 砍到 4000。在 100-update
+预算下，梯度质量由数据覆盖主导（ES 每 epoch 仅一次更新，无小批量平均机会），
+覆盖损失压倒方差收益。该优化在 per-update 全批口径（迁移版 batch=60000）下
+依然成立，不成立的是「逐图 es_batch=1」口径。
+
+1000 epoch 终局验证配置：pop=8000、relax、β 4→8→16（每 25ep ×2，≥16 切硬）、
+relax-scope all、lr 0.02 warmup 25ep + 余弦退火至 0.1×lr、validate_every 5、
+eval batch 256。基线参照：v4 100ep = 17.10%（22.9s/epoch → 优化后 6.8s/epoch，
+3.4×），SGD 5ep 全量 = 58.95%。结果见 artifacts/train_burn_es_tses_1000.csv
+（完成后回填本节）。
