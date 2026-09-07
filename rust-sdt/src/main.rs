@@ -150,6 +150,12 @@ enum Command {
         /// S6 松弛作用域：all（全部位点，v4 行为）| ssa（仅 SSA 位点 xs/q/k/v/kv，MLP/head 硬 LIF）
         #[arg(long, default_value = "all")]
         relax_scope: String,
+        /// 可变学习率：线性 warmup 的 epoch 数（0 = 恒定 lr）
+        #[arg(long, default_value_t = 0)]
+        lr_warmup: u32,
+        /// 可变学习率：余弦退火终值比例（lr_min = lr × 此值）
+        #[arg(long, default_value_t = 0.0)]
+        lr_min_frac: f64,
     },
 }
 
@@ -215,6 +221,8 @@ fn main() {
             beta,
             beta_anneal_every,
             relax_scope,
+            lr_warmup,
+            lr_min_frac,
         } => {
             crate::es_train::run_train_es(crate::es_train::EsArgs {
                 epochs,
@@ -236,6 +244,8 @@ fn main() {
                 beta,
                 beta_anneal_every,
                 relax_scope,
+                lr_warmup,
+                lr_min_frac,
             });
         }
     }

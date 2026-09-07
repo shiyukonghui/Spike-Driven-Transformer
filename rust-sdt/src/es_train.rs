@@ -528,6 +528,11 @@ impl AdamW {
         }
     }
 
+    /// 可变学习率调度（warmup+cosine）：每 epoch 更新一次
+    fn set_lr(&mut self, lr: f32) {
+        self.lr = lr;
+    }
+
     /// 一次更新：grads 为「已取负」的 ES 梯度（与迁移版 do_update 返回值同号）
     fn step(&mut self, params: &mut [Tensor<B, 2>], grads: &[Tensor<B, 2>]) {
         self.step += 1;
@@ -603,6 +608,10 @@ pub struct EsArgs {
     pub beta_anneal_every: u32,
     /// S6 松弛作用域："all"（全部位点）| "ssa"（仅 SSA 位点，MLP/head 硬 LIF）
     pub relax_scope: String,
+    /// 可变学习率：线性 warmup 的 epoch 数（0 = 恒定 lr）
+    pub lr_warmup: u32,
+    /// 可变学习率：余弦退火终值比例（lr_min = lr × lr_min_frac）
+    pub lr_min_frac: f64,
 }
 
 /// 内层 wgpu 设备引用
@@ -1687,6 +1696,23 @@ pub fn run_train_es_factored(args: EsArgs) {
             args.beta
         };
 
+        // 可变学习率：线性 warmup + 余弦退火（lr_warmup>0 启用；ES 每 epoch 一次 AdamW step）
+        let lr_t = if args.lr_warmup > 0 {
+            let ep = epoch as f64;
+            let w = args.lr_warmup as f64;
+            let tot = args.epochs as f64;
+            if epoch < args.lr_warmup {
+                args.lr * ((ep + 1.0) / w)
+            } else {
+                let prog = ((ep - w) / (tot - w).max(1.0)).min(1.0);
+                let cosv = 0.5 * (1.0 + (std::f64::consts::PI * prog).cos());
+                args.lr * (args.lr_min_frac + (1.0 - args.lr_min_frac) * cosv)
+            }
+        } else {
+            args.lr
+        };
+        optim.set_lr(lr_t as f32);
+
         // σ_slot 每 epoch 重算（随参数演化自适应）
         let mut sigma_lora = Vec::with_capacity(lora_slots.len());
         let mut sigma_dense = Vec::with_capacity(dense_slots.len());
@@ -1821,7 +1847,7 @@ pub fn run_train_es_factored(args: EsArgs) {
             }
             val_str = format!("{val_top1:.2}");
             println!(
-                "epoch={}/{}, train_top1={:.2}%, train_loglik={:.4}, val_top1={:.2}%, best_val={:.2}%{}（gen {:.1}s fwd {:.1}s，本轮 {:.1}s）",
+                "epoch={}/{}, train_top1={:.2}%, train_loglik={:.4}, val_top1={:.2}%, best_val={:.2}%{}（gen {:.1}s fwd {:.1}s，本轮 {:.1}s，lr={:.5}）",
                 epoch + 1, args.epochs, train_top1, train_loglik, val_top1, best_val,
                 if args.relax {
                     if args.relax && beta_t < 16.0 {
@@ -1833,7 +1859,8 @@ pub fn run_train_es_factored(args: EsArgs) {
                     String::new()
                 },
                 gen_time, fwd_time,
-                ep_start.elapsed().as_secs_f32()
+                ep_start.elapsed().as_secs_f32(),
+                lr_t
             );
         } else {
             println!(
