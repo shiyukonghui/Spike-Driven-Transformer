@@ -1505,8 +1505,12 @@ pub fn run_train_es_factored(args: EsArgs) {
             .iter()
             .map(|p| Tensor::<B, 2>::zeros(p.dims(), device))
             .collect();
-        let mut raws_all: Vec<f32> = Vec::with_capacity(args.pop);
-        let mut epoch_correct = 0usize;
+        // S1 优化：raw 统计与正确数全程 GPU 累积，epoch 末只读 3 个标量
+        // （删除 62×2 次 into_scalar 强制同步——每次 sync 都会打断 CPU↔GPU 流水线）
+        let mut raw_sum_t = Tensor::<B, 1>::zeros([1], device);
+        let mut raw_sumsq_t = Tensor::<B, 1>::zeros([1], device);
+        let mut correct_acc = Tensor::<B, 1>::zeros([1], device);
+        let mut n_used = 0usize;
 
         let mut gen_time = 0.0_f32;
         let mut fwd_time = 0.0_f32;
@@ -1553,8 +1557,8 @@ pub fn run_train_es_factored(args: EsArgs) {
             let onehot = one_hot(&data.train_y, &cand_slice, cfg.num_classes, device);
             let raw = (logsm * onehot).sum_dim(1).reshape([cand_slice.len()]); // [C]
             let pred = logits.argmax(1).reshape([cand_slice.len()]);
-            let correct_t = pred.equal(targets).float().sum().into_scalar();
-            epoch_correct += correct_t as usize;
+            correct_acc = correct_acc.clone() + pred.equal(targets).float().sum();
+            n_used += cand_slice.len();
             fwd_time += t1.elapsed().as_secs_f32();
 
             // ---- 3) 梯度充分统计量累积（同一批因子，无 CPU 回传）----
@@ -1571,19 +1575,19 @@ pub fn run_train_es_factored(args: EsArgs) {
                 let g = noise.clone().transpose().matmul(raw.clone().reshape([cand_slice.len(), 1])); // [n,1]
                 grad_acc[nd + di] = grad_acc[nd + di].clone() + g;
             }
-            raws_all.extend(
-                raw.into_data()
-                    .convert::<f32>()
-                    .to_vec::<f32>()
-                    .expect("读取 raw fitness 失败"),
-            );
+            raw_sum_t = raw_sum_t.clone() + raw.clone().sum();
+            raw_sumsq_t = raw_sumsq_t.clone() + raw.powf_scalar(2.0).sum();
         }
 
         // ---- 4) 全局 z-score（一次）+ 单次 AdamW + 写回 ----
         // pop=n_train 时 ΣΔW≡0（M1），修正项 (g − o·mean) ≡ g，直接乘 scale。
-        let n_used = raws_all.len();
-        let mean = raws_all.iter().sum::<f32>() / n_used as f32;
-        let var = (raws_all.iter().map(|v| v * v).sum::<f32>() / n_used as f32 - mean * mean).max(0.0);
+        // S1：epoch 末一次性回读 3 个标量（raw_sum/raw_sumsq/correct）
+        let n_used = n_used; // 已在循环内累加
+        let s1v = raw_sum_t.into_scalar();
+        let s2v = raw_sumsq_t.into_scalar();
+        let ccv = correct_acc.into_scalar();
+        let mean = s1v / n_used as f32;
+        let var = (s2v / n_used as f32 - mean * mean).max(0.0);
         let stdv = (var + 1e-5).sqrt();
         let scale = -1.0 / (stdv * (n_used as f32).sqrt());
         let grads: Vec<Tensor<B, 2>> = grad_acc
@@ -1597,7 +1601,7 @@ pub fn run_train_es_factored(args: EsArgs) {
         <B as burn::tensor::backend::Backend>::sync(device).expect("GPU 同步失败");
         <B as burn::tensor::backend::Backend>::memory_cleanup(device);
 
-        let train_top1 = epoch_correct as f64 / n_used as f64 * 100.0;
+        let train_top1 = ccv as f64 / n_used as f64 * 100.0;
         let train_loglik = mean as f64;
         if train_top1 > best_train {
             best_train = train_top1;
