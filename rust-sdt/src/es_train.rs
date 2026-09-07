@@ -1738,7 +1738,10 @@ pub fn run_train_es_factored(args: EsArgs) {
                 .reshape([1, cand_slice.len(), 3, 32, 32])
                 .repeat_dim(0, args.time_steps); // [T, C, 3, 32, 32]
             let targets = lab_t.clone().select(0, idx_t); // [C] Int
-            let logits = es_forward_factored(images, &base, &factors, &cfg, args.relax, beta_t); // [C, 10]
+            // S4 优化：β 退火到 16 后切硬 LIF（σ(16·(h−θ)) 与阶跃的 EMA 差 <0.5%，
+            // 松弛前向的 sigmoid/乘加不再有信息量，省 ~2s/epoch）
+            let relax_fwd = args.relax && beta_t < 16.0;
+            let logits = es_forward_factored(images, &base, &factors, &cfg, relax_fwd, beta_t); // [C, 10]
             let logsm = log_softmax2(logits.clone());
             // S7 优化：one_hot 构造+乘法 → gather（raw[c] = logsm[c, targets[c]]，逐位一致）
             let raw = logsm
@@ -1806,7 +1809,15 @@ pub fn run_train_es_factored(args: EsArgs) {
             println!(
                 "epoch={}/{}, train_top1={:.2}%, train_loglik={:.4}, val_top1={:.2}%, best_val={:.2}%{}（gen {:.1}s fwd {:.1}s，本轮 {:.1}s）",
                 epoch + 1, args.epochs, train_top1, train_loglik, val_top1, best_val,
-                if args.relax { format!(" β={beta_t:.1}(松弛前向)") } else { String::new() },
+                if args.relax {
+                    if args.relax && beta_t < 16.0 {
+                        format!(" β={beta_t:.1}(松弛前向)")
+                    } else {
+                        format!(" β={beta_t:.1}(硬前向)")
+                    }
+                } else {
+                    String::new()
+                },
                 gen_time, fwd_time,
                 ep_start.elapsed().as_secs_f32()
             );
