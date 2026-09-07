@@ -147,6 +147,9 @@ enum Command {
         /// β 退火周期：每 N 个 epoch β×2（上限 16）；0 = 固定 β
         #[arg(long, default_value_t = 0)]
         beta_anneal_every: u32,
+        /// S6 松弛作用域：all（全部位点，v4 行为）| ssa（仅 SSA 位点 xs/q/k/v/kv，MLP/head 硬 LIF）
+        #[arg(long, default_value = "all")]
+        relax_scope: String,
     },
 }
 
@@ -211,6 +214,7 @@ fn main() {
             relax,
             beta,
             beta_anneal_every,
+            relax_scope,
         } => {
             crate::es_train::run_train_es(crate::es_train::EsArgs {
                 epochs,
@@ -231,6 +235,7 @@ fn main() {
                 relax,
                 beta,
                 beta_anneal_every,
+                relax_scope,
             });
         }
     }

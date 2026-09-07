@@ -601,6 +601,8 @@ pub struct EsArgs {
     pub beta: f32,
     /// β 退火周期（每 N epoch ×2，上限 16；0 = 固定）
     pub beta_anneal_every: u32,
+    /// S6 松弛作用域："all"（全部位点）| "ssa"（仅 SSA 位点，MLP/head 硬 LIF）
+    pub relax_scope: String,
 }
 
 /// 内层 wgpu 设备引用
@@ -1412,21 +1414,31 @@ fn es_forward_factored(
     base: &SdtWeights<B>,
     f: &ChunkFactors,
     cfg: &SdtConfig,
-    relax: bool,
+    relax_ssa: bool,
+    relax_mlp: bool,
     beta: f32,
 ) -> Tensor<B, 2> {
     let t = images.dims()[0];
     let c = images.dims()[1];
     let device = es_dev();
+    // S6：松弛作用域——ssa 模式只松弛 SSA 位点（xs/q/k/v/kv，梯度信号集中处），
+    // MLP 位点（x1/x2）与 head 用硬 LIF；all 模式全部松弛（与 v4 行为一致）
     let lif = |x: Tensor<B, 5>, th: f64| -> Tensor<B, 5> {
-        if relax {
+        if relax_ssa {
+            lif_seq_relaxed(x, th, beta as f64)
+        } else {
+            lif_seq(x, th)
+        }
+    };
+    let lif_mlp = |x: Tensor<B, 5>, th: f64| -> Tensor<B, 5> {
+        if relax_mlp {
             lif_seq_relaxed(x, th, beta as f64)
         } else {
             lif_seq(x, th)
         }
     };
     let lif4 = |x: Tensor<B, 4>, th: f64| -> Tensor<B, 4> {
-        if relax {
+        if relax_mlp {
             lif_seq_relaxed(x, th, beta as f64)
         } else {
             lif_seq(x, th)
@@ -1484,10 +1496,10 @@ fn es_forward_factored(
 
         // MLP
         let identity2 = ssa_out.clone();
-        let x1 = lif(ssa_out, 1.0);
+        let x1 = lif_mlp(ssa_out, 1.0);
         let hidden = cfg.mlp_hidden();
         let x1c = noisy_conv1x1(x1, &w2(4), bias5(4, hidden), &lw(4).0, &lw(4).1);
-        let x2 = lif(x1c, 1.0);
+        let x2 = lif_mlp(x1c, 1.0);
         let x2c = noisy_conv1x1(x2, &w2(5), bias5(5, ch), &lw(5).0, &lw(5).1);
         x = x2c + identity2;
     }
@@ -1739,9 +1751,11 @@ pub fn run_train_es_factored(args: EsArgs) {
                 .repeat_dim(0, args.time_steps); // [T, C, 3, 32, 32]
             let targets = lab_t.clone().select(0, idx_t); // [C] Int
             // S4 优化：β 退火到 16 后切硬 LIF（σ(16·(h−θ)) 与阶跃的 EMA 差 <0.5%，
-            // 松弛前向的 sigmoid/乘加不再有信息量，省 ~2s/epoch）
+            // 松弛前向的 sigmoid/乘加不再有信息量）
+            // S6：relax-scope=ssa 时 MLP/head 位点保持硬 LIF
             let relax_fwd = args.relax && beta_t < 16.0;
-            let logits = es_forward_factored(images, &base, &factors, &cfg, relax_fwd, beta_t); // [C, 10]
+            let relax_mlp = relax_fwd && args.relax_scope != "ssa";
+            let logits = es_forward_factored(images, &base, &factors, &cfg, relax_fwd, relax_mlp, beta_t); // [C, 10]
             let logsm = log_softmax2(logits.clone());
             // S7 优化：one_hot 构造+乘法 → gather（raw[c] = logsm[c, targets[c]]，逐位一致）
             let raw = logsm
