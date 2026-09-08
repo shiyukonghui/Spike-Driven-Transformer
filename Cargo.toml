@@ -1,7 +1,7 @@
 # 根目录仅作为 Cargo workspace 占位清单（原为无效的独立 package 清单），
 # 实际的 Rust 实现位于 rust-sdt 子目录中
 [workspace]
-members = ["rust-sdt"]
+members = ["rust-sdt", "paper-cli"]
 resolver = "2"
 
 # 本地补丁：burn-fusion 0.21.0 恢复 0.18 的 drop-triggered drain 语义。
