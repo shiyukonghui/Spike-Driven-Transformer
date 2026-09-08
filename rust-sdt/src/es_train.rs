@@ -620,6 +620,9 @@ pub struct EsArgs {
     pub qam: String,
     /// QAM 位点集："head"（feat，默认）| "ssa"（xs/q/k/v/kv）| "all"（8 位点）
     pub qam_sites: String,
+    /// ± 对共享同一样本（协议修正）：候选 2k/2k+1 评估同一图像、噪声反号——
+    /// 对偶差分中数据难度项精确消去，深槽的扰动响应不再被图像难度方差淹没
+    pub pair_shared: bool,
 }
 
 /// 内层 wgpu 设备引用
@@ -1971,7 +1974,19 @@ pub fn run_train_es_factored(args: EsArgs) {
         for k in 0..n_chunks {
             // ---- 1) S3：GPU 端因子生成（零 CPU 生成、零 PCIe 上传）----
             let t0 = std::time::Instant::now();
-            let cand_slice: Vec<usize> = order_vec[k * args.chunk..(k + 1) * args.chunk].to_vec();
+            // --pair-shared：候选 2k/2k+1 共享同一样本（位置 p 的图像 = order[p>>1]），
+            // 噪声 id/符号按全局位置（与原始 eggroll 的 thread_id 语义一致：pair=id/2，符号=id 奇偶）。
+            // 默认（false）保持历史行为：id=图像行号，± 对各自评估不同样本（数据项混入 z 差分）。
+            let (ids_slice, img_slice): (Vec<usize>, Vec<usize>) = if args.pair_shared {
+                let pos: Vec<usize> = (k * args.chunk..(k + 1) * args.chunk).collect();
+                let imgs = pos.iter().map(|&p| order_vec[p >> 1]).collect();
+                (pos, imgs)
+            } else {
+                let c = order_vec[k * args.chunk..(k + 1) * args.chunk].to_vec();
+                let d = c.clone();
+                (c, d)
+            };
+            let cand_slice = ids_slice;
             let factors = gen_chunk_factors_gpu(
                 &lora_slots,
                 &dense_slots,
@@ -2006,18 +2021,19 @@ pub fn run_train_es_factored(args: EsArgs) {
             // ---- 2) 因式噪声前向 + fitness ----
             let t1 = std::time::Instant::now();
             // S2：GPU 行选择替代 get_batch（语义与 [T,B,3,32,32] 逐位一致）
+            // 图像/标签按 img_slice（--pair-shared 时相邻两位同图）
             let idx_t = Tensor::<B, 1, Int>::from_data(
                 burn::tensor::TensorData::new(
-                    cand_slice.iter().map(|&i| i as i64).collect::<Vec<i64>>(),
-                    [cand_slice.len()],
+                    img_slice.iter().map(|&i| i as i64).collect::<Vec<i64>>(),
+                    [img_slice.len()],
                 ),
                 device,
             );
-            let onehot = idx_t.clone().reshape([cand_slice.len(), 1]).equal(ar_t.clone()).float(); // [C,N]
+            let onehot = idx_t.clone().reshape([img_slice.len(), 1]).equal(ar_t.clone()).float(); // [C,N]
             let sel = onehot.matmul(pix_t.clone()); // [C, 3072]（f32 精确行拷贝）
             let images = sel
-                .reshape([cand_slice.len(), 3, 32, 32])
-                .reshape([1, cand_slice.len(), 3, 32, 32])
+                .reshape([img_slice.len(), 3, 32, 32])
+                .reshape([1, img_slice.len(), 3, 32, 32])
                 .repeat_dim(0, args.time_steps); // [T, C, 3, 32, 32]
             let targets = lab_t.clone().select(0, idx_t); // [C] Int
             // S4 优化：β 退火到 16 后切硬 LIF——Run-1（1000ep）实测为训练质量负优化
@@ -2030,8 +2046,8 @@ pub fn run_train_es_factored(args: EsArgs) {
             let logsm = log_softmax2(logits.clone());
             // S7 优化：one_hot 构造+乘法 → gather（raw[c] = logsm[c, targets[c]]，逐位一致）
             let raw = logsm
-                .gather(1, targets.clone().reshape([cand_slice.len(), 1]))
-                .reshape([cand_slice.len()]); // [C]
+                .gather(1, targets.clone().reshape([img_slice.len(), 1]))
+                .reshape([img_slice.len()]); // [C]
             let pred = logits.argmax(1).reshape([cand_slice.len()]);
             correct_acc = correct_acc.clone() + pred.equal(targets).float().sum();
             n_used += cand_slice.len();

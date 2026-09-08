@@ -165,6 +165,9 @@ enum Command {
         /// QAM 位点集："head"（feat，位点深度律最高信号）| "ssa" | "all"
         #[arg(long, default_value = "head")]
         qam_sites: String,
+        /// ± 对共享同一样本（协议修正：对偶差分消去数据难度项）
+        #[arg(long, default_value_t = false)]
+        pair_shared: bool,
     },
     /// 混合估计器（ES_MANIFOLD §13）：SGD（W/b 精确梯度）+ ES（v_th 8 标量 + QAM 低维槽）
     TrainMixed {
@@ -290,6 +293,7 @@ fn main() {
             hard_at_16,
             qam,
             qam_sites,
+            pair_shared,
         } => {
             crate::es_train::run_train_es(crate::es_train::EsArgs {
                 epochs,
@@ -316,6 +320,7 @@ fn main() {
                 hard_at_16,
                 qam,
                 qam_sites,
+                pair_shared,
             });
         }
         Command::TrainMixed {
