@@ -177,6 +177,12 @@ enum Command {
         /// 逐候选零噪声锚点（控制变量 X1）：raw′=raw−b₀(x) 再 z-score
         #[arg(long, default_value_t = false)]
         baseline_zero: bool,
+        /// 逐槽步长自适应（X3，NES/CSA 式漂移幅值 EMA）
+        #[arg(long, default_value_t = false)]
+        sigma_adapt: bool,
+        /// σ 自适应周期（epoch）
+        #[arg(long, default_value_t = 10)]
+        sigma_adapt_every: u32,
     },
     /// 混合估计器（ES_MANIFOLD §13）：SGD（W/b 精确梯度）+ ES（v_th 8 标量 + QAM 低维槽）
     TrainMixed {
@@ -306,6 +312,8 @@ fn main() {
             blocks,
             freeze_lora,
             baseline_zero,
+            sigma_adapt,
+            sigma_adapt_every,
         } => {
             crate::es_train::run_train_es(crate::es_train::EsArgs {
                 epochs,
@@ -336,6 +344,8 @@ fn main() {
                 blocks,
                 freeze_lora,
                 baseline_zero,
+                sigma_adapt,
+                sigma_adapt_every,
             });
         }
         Command::TrainMixed {

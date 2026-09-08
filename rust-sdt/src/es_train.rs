@@ -635,6 +635,12 @@ pub struct EsArgs {
     /// 图像难度项逐点扣除，z 尺度从数据方差塌缩为响应方差
     /// （GMD 核化均值偏移的锚点项 + EggRollBS 基线扣除的样本级推广）
     pub baseline_zero: bool,
+    /// 逐槽步长自适应（X3，NES/CSA 式）：每槽漂移幅值 EMA，每 N epoch 以
+    /// r=(ema_i/median)^0.5 缩放 σ_slot∈[0.25×,4×]——有信号的槽增噪、
+    /// 死槽减噪，直接攻击“深槽噪声污染共享 σ_z”的消融发现
+    pub sigma_adapt: bool,
+    /// σ 自适应周期（epoch）
+    pub sigma_adapt_every: u32,
 }
 
 /// 内层 wgpu 设备引用
@@ -2307,6 +2313,11 @@ pub fn run_train_es_factored(args: EsArgs) {
     let mut best_train = 0.0_f64;
     let mut cum_t = 0.0_f64;
 
+    // X3 逐槽步长自适应状态（NES/CSA 坐标级 σ 自适应的漂移幅值版）
+    let n_slots_total = lora_slots.len() + dense_slots.len();
+    let mut ema_g: Vec<f32> = vec![0.0; n_slots_total];
+    let mut sigma_scale: Vec<f32> = vec![1.0; n_slots_total];
+
     for epoch in 0..args.epochs {
         let ep_start = std::time::Instant::now();
         let order_full = crate::loader::shuffled_indices(data.n_train, args.seed + epoch as u64);
@@ -2354,6 +2365,8 @@ pub fn run_train_es_factored(args: EsArgs) {
             } else {
                 args.sigma * var.sqrt()
             };
+            // X3：逐槽自适应比例（每槽独立缩放，含 QAM 槽）
+            let s = s * sigma_scale[i];
             if i < lora_slots.len() {
                 sigma_lora.push(s);
             } else {
@@ -2551,6 +2564,42 @@ pub fn run_train_es_factored(args: EsArgs) {
             .map(|g| g.clone().powf_scalar(2.0).sum().into_scalar())
             .sum();
         let gnorm = gnorm2.sqrt();
+        // X3：逐槽漂移幅值 EMA + 每 10 epoch 一次 σ 比例自适应
+        if args.sigma_adapt {
+            for (i, g) in grads.iter().enumerate() {
+                let n = g.clone().powf_scalar(2.0).sum().into_scalar().sqrt();
+                ema_g[i] = if epoch == 0 { n } else { 0.7 * ema_g[i] + 0.3 * n };
+            }
+            if (epoch + 1) % args.sigma_adapt_every.max(1) == 0 {
+                let mut sortedv = ema_g.clone();
+                sortedv.sort_by(|a, b| a.partial_cmp(b).unwrap());
+                let med = sortedv[sortedv.len() / 2].max(1e-12);
+                for (i, e) in ema_g.iter().enumerate() {
+                    let r = (e + 1e-12) / med;
+                    sigma_scale[i] = (sigma_scale[i] * r.sqrt()).clamp(0.25, 4.0);
+                }
+                let slot_name = |k: usize| -> String {
+                    if k < lora_slots.len() {
+                        format!("{:?}", lora_slots[k].loc)
+                    } else {
+                        format!("{:?}", dense_slots[k - lora_slots.len()].loc)
+                    }
+                };
+                let mut idx: Vec<usize> = (0..n_slots_total).collect();
+                idx.sort_by(|&a, &b| sigma_scale[b].partial_cmp(&sigma_scale[a]).unwrap());
+                println!(
+                    "  [σ-adapt] ↑{} {:.2}× ↓{} {:.2}×（epoch {}）",
+                    slot_name(idx[0]),
+                    sigma_scale[idx[0]],
+                    slot_name(idx[n_slots_total - 1]),
+                    sigma_scale[idx[n_slots_total - 1]],
+                    epoch + 1
+                );
+                for e in ema_g.iter_mut() {
+                    *e = med;
+                }
+            }
+        }
         // freeze_lora：AdamW 的 wd 会衰减零梯度槽——步前保存、步后恢复，保证严格冻结
         let frozen_saved: Option<Vec<Tensor<B, 2>>> = if args.freeze_lora && nl_conv > 0 {
             Some(params2d[..nl_conv].to_vec())
