@@ -644,6 +644,8 @@ pub struct EsArgs {
     /// 温缩 z-score（X2-lite）：用上一 epoch 的 raw 分布把本 epoch 候选
     /// winsorize 到 ±3σ，抑制重尾离群候选对估计器的支配（ES 梯度裁剪的标准做法）
     pub robust_z: bool,
+    /// hard 0/1 适应度（原库默认）：argmax==标签，替代 loglik（后期不饱和）
+    pub fitness_hard: bool,
 }
 
 /// 内层 wgpu 设备引用
@@ -2790,9 +2792,16 @@ pub fn run_train_es_factored(args: EsArgs) {
             }; // [C, 10]
             let logsm = log_softmax2(logits.clone());
             // S7 优化：one_hot 构造+乘法 → gather（raw[c] = logsm[c, targets[c]]，逐位一致）
-            let mut raw = logsm
-                .gather(1, targets.clone().reshape([img_slice.len(), 1]))
-                .reshape([img_slice.len()]); // [C]
+            let mut raw = if args.fitness_hard {
+                // 原库默认适应度：hard 0/1（argmax == 标签）——二值、自归一化、
+                // 后期不饱和（对照 loglik-β4 的 sigmoid 梯度衰减）
+                let pred = logits.clone().argmax(1).reshape([img_slice.len()]); // [C] Int
+                pred.equal(targets.clone()).float().reshape([img_slice.len()])
+            } else {
+                logsm
+                    .gather(1, targets.clone().reshape([img_slice.len(), 1]))
+                    .reshape([img_slice.len()])
+            }; // [C]
             // X1 控制变量：raw′ₙ = rawₙ − b₀(xₙ)（逐候选零噪声锚点）
             if let Some(an) = anchors_gpu.as_ref() {
                 let an_g = an.clone().select(0, idx_t.clone());
