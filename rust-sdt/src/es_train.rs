@@ -646,6 +646,8 @@ pub struct EsArgs {
     pub robust_z: bool,
     /// hard 0/1 适应度（原库默认）：argmax==标签，替代 loglik（后期不饱和）
     pub fitness_hard: bool,
+    /// fc 模式编码：static（静态重复，默认）| poisson（泊松率编码，原库默认）
+    pub encoding: String,
 }
 
 /// 内层 wgpu 设备引用
@@ -2188,10 +2190,21 @@ fn es_forward_fc(
     relax: bool,
     beta: f32,
     qam: Option<&QamRun<B>>,
+    poisson: bool,
 ) -> Tensor<B, 2> {
     let d = images.dims();
     let (t, c) = (d[0], d[1]);
-    let x3 = images.reshape([t, c, 3072]).permute([1, 0, 2]); // [C,T,3072]
+    let mut x3 = images.reshape([t, c, 3072]).permute([1, 0, 2]); // [C,T,3072]
+    if poisson {
+        // 泊松率编码（原库默认）：每步以像素强度为概率发尖峰
+        // x_t = (rand < img) ? 1 : 0——输入噪声 = 持续探索（对照静态重复）
+        let rand_t: Tensor<B, 3> = Tensor::random(
+            [c, t, 3072],
+            burn::tensor::Distribution::Uniform(0.0, 1.0),
+            &x3.device(),
+        );
+        x3 = rand_t.lower_equal(x3.clone()).float();
+    }
 
     let lif_fc = |cur: Tensor<B, 3>| -> Tensor<B, 3> {
         // [C,T,128] → LIF over T（v_th=0.3，与原始库一致；naive 1.0 会静默网络）
@@ -2335,7 +2348,7 @@ fn eval_es_fc(
         let c = chunk.len();
         let factors = zero_factors(lora_slots, dense_slots, rank, c, device);
         let qam_run = qam_run_zero(c, qam_eval, device);
-        let logits = es_forward_fc(images, base_fc, &factors, false, 4.0, qam_run.as_ref());
+        let logits = es_forward_fc(images, base_fc, &factors, false, 4.0, qam_run.as_ref(), false);
         let pred = logits.argmax(1).reshape([chunk.len()]);
         let pred_v: Vec<i64> = pred
             .into_data()
@@ -2533,6 +2546,11 @@ pub fn run_train_es_factored(args: EsArgs) {
     } else {
         None
     };
+    assert!(
+        fc_mode || args.encoding == "static",
+        "--encoding poisson 仅支持 --blocks fc"
+    );
+    let fc_poisson = args.encoding == "poisson";
     let mut params2d = if fc_mode {
         factored_params2d_fc(fc_base.as_ref().unwrap(), &lora_slots, &dense_slots, device)
     } else {
@@ -2787,7 +2805,7 @@ pub fn run_train_es_factored(args: EsArgs) {
                 "conv" => es_forward_factored(images, &base, &factors, &cfg, relax_fwd, relax_mlp, beta_t, qam_run.as_ref()), // [C, 10]
                 "none" => es_forward_noconv(images, &base, &factors, &cfg, relax_fwd, relax_mlp, beta_t, qam_run.as_ref()),
                 "probe" => es_forward_probe(images, &base, &factors, &cfg),
-                "fc" => es_forward_fc(images, fc_base.as_ref().unwrap(), &factors, relax_fwd, beta_t, qam_run.as_ref()),
+                "fc" => es_forward_fc(images, fc_base.as_ref().unwrap(), &factors, relax_fwd, beta_t, qam_run.as_ref(), fc_poisson),
                 other => panic!("未知 --blocks: {other}"),
             }; // [C, 10]
             let logsm = log_softmax2(logits.clone());

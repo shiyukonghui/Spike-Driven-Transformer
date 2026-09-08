@@ -189,6 +189,9 @@ enum Command {
         /// hard 0/1 适应度（原库默认）：argmax==标签 替代 loglik
         #[arg(long, default_value_t = false)]
         fitness_hard: bool,
+        /// fc 编码：static（默认）| poisson（泊松率编码，原库默认）
+        #[arg(long, default_value = "static")]
+        encoding: String,
     },
     /// 混合估计器（ES_MANIFOLD §13）：SGD（W/b 精确梯度）+ ES（v_th 8 标量 + QAM 低维槽）
     TrainMixed {
@@ -322,6 +325,7 @@ fn main() {
             sigma_adapt_every,
             robust_z,
             fitness_hard,
+            encoding,
         } => {
             crate::es_train::run_train_es(crate::es_train::EsArgs {
                 epochs,
@@ -356,6 +360,7 @@ fn main() {
                 sigma_adapt_every,
                 robust_z,
                 fitness_hard,
+                encoding,
             });
         }
         Command::TrainMixed {
