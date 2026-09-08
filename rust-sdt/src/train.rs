@@ -573,7 +573,7 @@ where
 
         // 前向（复用统一前向；to_weights 产出 autodiff 后端的只读权重视图）
         let weights = model.to_weights();
-        let logits = forward_full(images, &weights, cfg);
+        let logits = forward_full(images, &weights, cfg, None);
 
         // 交叉熵损失（[B] -> 取均值得到标量）
         let loss = loss_fn.forward(logits, targets);
@@ -656,13 +656,13 @@ fn eval_top1(
         let (logits, targets) = if eval_backend == "autodiff" {
             let (images, targets) = data.get_batch(Split::Test, chunk, t, device);
             let weights = model.to_weights();
-            let logits = forward_full(images, &weights, cfg);
+            let logits = forward_full(images, &weights, cfg, None);
             let logits = logits.detach().inner();
             let targets = targets.inner();
             (logits, targets)
         } else {
             let (images, targets) = data.get_batch(Split::Test, chunk, t, wgpu_dev());
-            let logits = forward_full(images, &weights_wgpu, cfg);
+            let logits = forward_full(images, &weights_wgpu, cfg, None);
             (logits, targets)
         };
         let pred = logits.argmax(1);
@@ -1230,7 +1230,7 @@ pub fn run_mem_probe(iters: u32) {
         };
 
         let weights = model.to_weights();
-        let logits = forward_full(images, &weights, &cfg);
+        let logits = forward_full(images, &weights, &cfg, None);
 
         let loss = loss_fn.forward(logits, targets);
         let _ = loss.clone().into_scalar();

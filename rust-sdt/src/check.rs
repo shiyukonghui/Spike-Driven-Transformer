@@ -83,7 +83,7 @@ pub fn run_forward_check(npz_path: &str, _seed: u64) {
 
     // Burn 前向（泛型化后不再收集分层钩子，仅对照整体 logits；
     // 逐层对照语义与本实现一致，由历史版本的带 taps 前向承担）
-    let logits = forward_full(x, &weights, &cfg);
+    let logits = forward_full(x, &weights, &cfg, None);
 
     // 整体 logits 对照
     let pt_logits = npz.get("logits").expect("缺少 logits");

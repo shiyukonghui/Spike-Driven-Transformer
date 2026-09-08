@@ -258,18 +258,57 @@ pub fn unshape_heads<B: Backend>(
 /// 输入 [T, B, C, H, W]，输出同形状
 /// 与 PyTorch MS_SSA_Conv.forward 严格一致：kv_sum 直接过 LIF(0.5)，
 /// 不做 talking_heads Conv1d 头间混合。
+/// QAM 调制权重（ES_MANIFOLD_NOTE §12）：每启用位点 (a, φ)，
+/// m = (1+a)·cos(φ) 乘在 LIF 输入电流上（增益-阈值对偶：θ_i=θ/m_i, α_i=β·m_i）。
+/// 位点 id：0=xs 1=q 2=k 3=v 4=kv 5=x1 6=x2 7=feat；m 按**位点类型**跨 block 共享。
+/// 神经元数：xs/q/k/v/kv/x1/feat = 256，x2 = 1024（mlp_hidden）。
+pub struct QamWeights<B: Backend> {
+    /// (site_id, a [n], phi [n])，n = 该位点神经元数
+    pub sites: Vec<(usize, Tensor<B, 1>, Tensor<B, 1>)>,
+}
+
+impl<B: Backend> QamWeights<B> {
+    pub fn site(&self, id: usize) -> Option<(&Tensor<B, 1>, &Tensor<B, 1>)> {
+        self.sites.iter().find(|(sid, _, _)| *sid == id).map(|(_, a, p)| (a, p))
+    }
+}
+
+/// 5 维位点电流调制：x [T,B,C,H,W] × m [C] → 乘在通道维
+fn qam_mul5<B: Backend>(x: Tensor<B, 5>, m: &Tensor<B, 1>) -> Tensor<B, 5> {
+    let c = x.dims()[2];
+    x * m.clone().reshape([1, 1, c, 1, 1])
+}
+
+/// kv 位点调制：kv [T,B,heads,1,hd] × m [heads·hd] → reshape 相乘
+fn qam_mul_kv<B: Backend>(kv: Tensor<B, 5>, m: &Tensor<B, 1>) -> Tensor<B, 5> {
+    let d = kv.dims();
+    kv * m.clone().reshape([1, 1, d[2], 1, d[4]])
+}
+
+/// 按 site id 取 m（存在则调制，否则原样返回）
+fn qam_apply5<B: Backend>(x: Tensor<B, 5>, qam: Option<&QamWeights<B>>, site: usize) -> Tensor<B, 5> {
+    match qam.and_then(|q| q.site(site)) {
+        Some((a, p)) => {
+            let m = (a.clone() + 1.0).mul_scalar(1.0) * p.clone().cos(); // (1+a)·cos(φ)
+            qam_mul5(x, &m)
+        }
+        None => x,
+    }
+}
+
 pub fn forward_ssa<B: Backend>(
     x: Tensor<B, 5>,
     bw: &BlockWeights<B>,
     cfg: &SdtConfig,
+    qam: Option<&QamWeights<B>>,
 ) -> Tensor<B, 5> {
     let d = x.dims();
     let (_t, _b, c, hh, ww) = (d[0], d[1], d[2], d[3], d[4]);
     let heads = cfg.num_heads;
     let head_dim = c / heads;
 
-    // shortcut LIF
-    let xs = lif(x.clone(), 1.0);
+    // shortcut LIF（xs 位点 0）
+    let xs = lif(qam_apply5(x.clone(), qam, 0), 1.0);
     let identity = x; // 残差取 LIF 之前的输入（与 PyTorch 一致）
 
     // q/k/v conv
@@ -277,10 +316,10 @@ pub fn forward_ssa<B: Backend>(
     let xk = conv_merge_tb(xs.clone(), &bw.k);
     let xv = conv_merge_tb(xs, &bw.v);
 
-    // q/k/v LIF
-    let q = lif(xq, 1.0);
-    let k = lif(xk, 1.0);
-    let v = lif(xv, 1.0);
+    // q/k/v LIF（位点 1/2/3）
+    let q = lif(qam_apply5(xq, qam, 1), 1.0);
+    let k = lif(qam_apply5(xk, qam, 2), 1.0);
+    let v = lif(qam_apply5(xv, qam, 3), 1.0);
 
     // 变形为 [T, B, heads, N, head_dim]
     let qh = reshape_heads(q, heads, head_dim);
@@ -292,7 +331,14 @@ pub fn forward_ssa<B: Backend>(
     #[cfg(feature = "debug_shape")]
     eprintln!("[调试] kv dims = {:?}, qh dims = {:?}", kv.dims(), qh.dims());
     // kv_sum 直接过 LIF(0.5)（PyTorch 只调用 talking_heads_lif，不做 Conv1d 混合）
-    let kv_spike = lif(kv, 0.5);
+    // kv 位点 4：m [heads·hd] reshape 相乘
+    let kv_spike = match qam.and_then(|q| q.site(4)) {
+        Some((a, p)) => {
+            let m = (a.clone() + 1.0) * p.clone().cos();
+            lif(qam_mul_kv(kv, &m), 0.5)
+        }
+        None => lif(kv, 0.5),
+    };
 
     // x = q ⊙ kv（广播相乘）
     let xattn = qh * kv_spike;
@@ -311,13 +357,16 @@ pub fn forward_mlp<B: Backend>(
     x: Tensor<B, 5>,
     bw: &BlockWeights<B>,
     _cfg: &SdtConfig,
+    qam: Option<&QamWeights<B>>,
 ) -> Tensor<B, 5> {
     let identity = x.clone();
     // fc1：LIF -> conv（无残差：hidden = dim*mlp_ratio != dim）
-    let x1 = lif(x, 1.0);
+    // x1 位点 5（输入 = ssa_out，256）
+    let x1 = lif(qam_apply5(x, qam, 5), 1.0);
     let x1c = conv_merge_tb(x1, &bw.fc1);
     // fc2：LIF -> conv，然后 x + identity
-    let x2 = lif(x1c, 1.0);
+    // x2 位点 6（输入 = fc1 conv 输出，1024）
+    let x2 = lif(qam_apply5(x1c, qam, 6), 1.0);
     let x2c = conv_merge_tb(x2, &bw.fc2);
     let out = x2c + identity;
     out
@@ -329,6 +378,7 @@ pub fn forward_full<B: Backend>(
     x_in: Tensor<B, 5>,
     w: &SdtWeights<B>,
     cfg: &SdtConfig,
+    qam: Option<&QamWeights<B>>,
 ) -> Tensor<B, 2> {
     let d = x_in.dims();
     let (t, b) = (d[0], d[1]);
@@ -342,8 +392,8 @@ pub fn forward_full<B: Backend>(
     for bw in &w.blk {
         #[cfg(feature = "debug_shape")]
         eprintln!("[调试] block 输入 dims = {:?}", x.dims());
-        let attn_out = forward_ssa(x, bw, cfg);
-        x = forward_mlp(attn_out, bw, cfg);
+        let attn_out = forward_ssa(x, bw, cfg, qam);
+        x = forward_mlp(attn_out, bw, cfg, qam);
     }
 
     // flatten(3).mean(3)：[T,B,C,H,W] -> [T,B,C]
@@ -353,7 +403,16 @@ pub fn forward_full<B: Backend>(
         .sum_dim(3)
         .div_scalar((fd[3] * fd[4]) as f32);
 
-    // head_lif（阈值 1.0）：feat 为 [T,B,C]（3 维），用通用 lif_seq 处理
+    // head_lif（阈值 1.0）：feat 为 [T,B,C,1]（4 维，sum_dim 保留维）
+    // feat 位点 7：m [C] 调制（紧邻读出——位点深度律下最高信号槽）
+    let feat = match qam.and_then(|q| q.site(7)) {
+        Some((a, p)) => {
+            let m = (a.clone() + 1.0) * p.clone().cos();
+            let c = feat.dims()[2];
+            feat * m.reshape([1, 1, c, 1])
+        }
+        None => feat,
+    };
     let feat_spike = lif_seq(feat, 1.0);
 
     // head linear：[T*B,C] x [C,num_classes] -> [T*B,num_classes]

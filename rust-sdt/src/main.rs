@@ -159,6 +159,12 @@ enum Command {
         /// S4（opt-in）：β≥16 时训练 fitness 切硬 LIF（默认关：全程松弛）
         #[arg(long, default_value_t = false)]
         hard_at_16: bool,
+        /// QAM 调制（ES_MANIFOLD §12）："off" | "learnable"（m=(1+a)·cos(φ)）
+        #[arg(long, default_value = "off")]
+        qam: String,
+        /// QAM 位点集："head"（feat，位点深度律最高信号）| "ssa" | "all"
+        #[arg(long, default_value = "head")]
+        qam_sites: String,
     },
 }
 
@@ -227,6 +233,8 @@ fn main() {
             lr_warmup,
             lr_min_frac,
             hard_at_16,
+            qam,
+            qam_sites,
         } => {
             crate::es_train::run_train_es(crate::es_train::EsArgs {
                 epochs,
@@ -251,6 +259,8 @@ fn main() {
                 lr_warmup,
                 lr_min_frac,
                 hard_at_16,
+                qam,
+                qam_sites,
             });
         }
     }
