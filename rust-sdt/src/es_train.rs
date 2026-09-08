@@ -641,6 +641,9 @@ pub struct EsArgs {
     pub sigma_adapt: bool,
     /// σ 自适应周期（epoch）
     pub sigma_adapt_every: u32,
+    /// 温缩 z-score（X2-lite）：用上一 epoch 的 raw 分布把本 epoch 候选
+    /// winsorize 到 ±3σ，抑制重尾离群候选对估计器的支配（ES 梯度裁剪的标准做法）
+    pub robust_z: bool,
 }
 
 /// 内层 wgpu 设备引用
@@ -2589,6 +2592,9 @@ pub fn run_train_es_factored(args: EsArgs) {
     let mut ema_g: Vec<f32> = vec![0.0; n_slots_total];
     let mut sigma_scale: Vec<f32> = vec![1.0; n_slots_total];
 
+    // X2-lite 温缩 z-score 状态：上一 epoch 的 raw 分布（epoch 0 不裁剪）
+    let mut robust_prev: Option<(f32, f32)> = None;
+
     for epoch in 0..args.epochs {
         let ep_start = std::time::Instant::now();
         let order_full = crate::loader::shuffled_indices(data.n_train, args.seed + epoch as u64);
@@ -2792,6 +2798,10 @@ pub fn run_train_es_factored(args: EsArgs) {
                 let an_g = an.clone().select(0, idx_t.clone());
                 raw = raw - an_g;
             }
+            // X2-lite 温缩：winsorize 到上一 epoch 分布的 ±3σ（重尾候选去支配）
+            if let Some((pm, ps)) = robust_prev {
+                raw = raw.clamp(pm - 3.0 * ps, pm + 3.0 * ps);
+            }
             let pred = logits.argmax(1).reshape([cand_slice.len()]);
             correct_acc = correct_acc.clone() + pred.equal(targets).float().sum();
             n_used += cand_slice.len();
@@ -2825,6 +2835,9 @@ pub fn run_train_es_factored(args: EsArgs) {
         let mean = s1v / n_used as f32;
         let var = (s2v / n_used as f32 - mean * mean).max(0.0);
         let stdv = (var + 1e-5).sqrt();
+        if args.robust_z {
+            robust_prev = Some((mean, stdv));
+        }
         let scale = -1.0 / (stdv * (n_used as f32).sqrt());
         let grads: Vec<Tensor<B, 2>> = grad_acc
             .into_iter()

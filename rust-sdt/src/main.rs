@@ -183,6 +183,9 @@ enum Command {
         /// σ 自适应周期（epoch）
         #[arg(long, default_value_t = 10)]
         sigma_adapt_every: u32,
+        /// 温缩 z-score（X2-lite）：候选 winsorize 到上一 epoch 分布的 ±3σ
+        #[arg(long, default_value_t = false)]
+        robust_z: bool,
     },
     /// 混合估计器（ES_MANIFOLD §13）：SGD（W/b 精确梯度）+ ES（v_th 8 标量 + QAM 低维槽）
     TrainMixed {
@@ -314,6 +317,7 @@ fn main() {
             baseline_zero,
             sigma_adapt,
             sigma_adapt_every,
+            robust_z,
         } => {
             crate::es_train::run_train_es(crate::es_train::EsArgs {
                 epochs,
@@ -346,6 +350,7 @@ fn main() {
                 baseline_zero,
                 sigma_adapt,
                 sigma_adapt_every,
+                robust_z,
             });
         }
         Command::TrainMixed {
