@@ -168,6 +168,12 @@ enum Command {
         /// ± 对共享同一样本（协议修正：对偶差分消去数据难度项）
         #[arg(long, default_value_t = false)]
         pair_shared: bool,
+        /// 块结构消融：conv（默认）| none（恒等直连）| probe（纯线性探针）
+        #[arg(long, default_value = "conv")]
+        blocks: String,
+        /// 冻结卷积权重槽（σ=0，仅 conv 模式有效）
+        #[arg(long, default_value_t = false)]
+        freeze_lora: bool,
     },
     /// 混合估计器（ES_MANIFOLD §13）：SGD（W/b 精确梯度）+ ES（v_th 8 标量 + QAM 低维槽）
     TrainMixed {
@@ -294,6 +300,8 @@ fn main() {
             qam,
             qam_sites,
             pair_shared,
+            blocks,
+            freeze_lora,
         } => {
             crate::es_train::run_train_es(crate::es_train::EsArgs {
                 epochs,
@@ -321,6 +329,8 @@ fn main() {
                 qam,
                 qam_sites,
                 pair_shared,
+                blocks,
+                freeze_lora,
             });
         }
         Command::TrainMixed {

@@ -623,6 +623,13 @@ pub struct EsArgs {
     /// ± 对共享同一样本（协议修正）：候选 2k/2k+1 评估同一图像、噪声反号——
     /// 对偶差分中数据难度项精确消去，深槽的扰动响应不再被图像难度方差淹没
     pub pair_shared: bool,
+    /// 块结构消融："conv"（默认，六个 1×1 conv/块）| "none"（恒等直连，
+    /// 注意力核直接作用于 SPS 特征，可训练= head+QAM）| "probe"（纯线性探针：
+    /// SPS→均值池化→线性 head，无 LIF/无块，可训练= head）
+    pub blocks: String,
+    /// 冻结卷积权重槽（σ_lora=0，仅 "conv" 模式有效）：只训 bias+head+QAM——
+    /// 检验“深槽只注噪不产信号”的稀释假设
+    pub freeze_lora: bool,
 }
 
 /// 内层 wgpu 设备引用
@@ -647,6 +654,87 @@ fn eval_es(
     for chunk in order.chunks(batch) {
         let (images, targets) = data.get_batch(Split::Test, chunk, t, device);
         let logits = forward_full(images, w, cfg, qam);
+        let pred = logits.argmax(1).reshape([chunk.len()]);
+        let pred_v: Vec<i64> = pred
+            .into_data()
+            .convert::<i64>()
+            .to_vec::<i64>()
+            .expect("读取预测失败");
+        let tgt_v: Vec<i64> = targets
+            .into_data()
+            .convert::<i64>()
+            .to_vec::<i64>()
+            .expect("读取标签失败");
+        for (p, y) in pred_v.iter().zip(tgt_v.iter()) {
+            if p == y {
+                correct += 1;
+            }
+        }
+        <B as burn::tensor::backend::Backend>::sync(device).expect("eval 逐批同步失败");
+        <B as burn::tensor::backend::Backend>::memory_cleanup(device);
+    }
+    <B as burn::tensor::backend::Backend>::sync(device).expect("eval 同步失败");
+    <B as burn::tensor::backend::Backend>::memory_cleanup(device);
+    correct as f64 / n as f64 * 100.0
+}
+
+/// 架构感知验证（none/probe 模式）：与训练前向同架构、零噪声。
+/// conv 模式直接走 eval_es（forward_full + QamWeights）。
+fn eval_es_arch(
+    w: &SdtWeights<B>,
+    qam_eval: Option<&QamWeights<B>>,
+    data: &Cifar10Npz,
+    batch: usize,
+    t: usize,
+    cfg: &SdtConfig,
+    blocks: &str,
+) -> f64 {
+    if blocks == "conv" {
+        return eval_es(w, qam_eval, data, batch, t, cfg);
+    }
+    let device = es_dev();
+    let n = data.n_test;
+    let order: Vec<usize> = (0..n).collect();
+    let mut correct = 0usize;
+    let head_in = w.head_w.dims()[1];
+    for chunk in order.chunks(batch) {
+        let (images, targets) = data.get_batch(Split::Test, chunk, t, device);
+        let c = chunk.len();
+        // 零噪声因子：lora[0]=(0,0)、dense[0]=0（head 无噪声）+ QAM deltas=0
+        let lora = vec![(
+            Tensor::<B, 3>::zeros([c, 1, cfg.num_classes], device),
+            Tensor::<B, 3>::zeros([c, 1, head_in], device),
+        )];
+        let mut dense = vec![Tensor::<B, 2>::zeros([c, cfg.num_classes], device)];
+        let qam_run = qam_eval.map(|q| {
+            let mut sites = Vec::new();
+            for (s, a, p) in &q.sites {
+                let nn = a.dims()[0];
+                let za = Tensor::<B, 2>::zeros([c, nn], device);
+                let zp = Tensor::<B, 2>::zeros([c, nn], device);
+                dense.push(za.clone());
+                dense.push(zp.clone());
+                sites.push((
+                    *s,
+                    a.clone().reshape([nn, 1]),
+                    p.clone().reshape([nn, 1]),
+                    za,
+                    zp,
+                ));
+            }
+            let vth = q
+                .vth
+                .iter()
+                .map(|(s, v)| (*s, *v, Tensor::<B, 1>::zeros([c], device)))
+                .collect();
+            QamRun { sites, vth }
+        });
+        let factors = ChunkFactors { lora, dense };
+        let logits = match blocks {
+            "none" => es_forward_noconv(images, w, &factors, cfg, false, false, 4.0, qam_run.as_ref()),
+            "probe" => es_forward_probe(images, w, &factors, cfg),
+            other => panic!("未知 --blocks: {other}"),
+        };
         let pred = logits.argmax(1).reshape([chunk.len()]);
         let pred_v: Vec<i64> = pred
             .into_data()
@@ -1015,10 +1103,44 @@ fn factored_slots(
     depths: usize,
     qam_sites: &[usize],
     vth_sites: &[usize],
+    blocks: &str,
 ) -> (Vec<FSlotSpec>, Vec<FSlotSpec>) {
     let mut lora = Vec::new();
     let mut dense = Vec::new();
     let mut ki = 0u64;
+    if blocks != "conv" {
+        // none/probe：无块卷积槽；none 保留 head+QAM（+vth），probe 只留 head
+        lora.push(FSlotSpec {
+            loc: FLoc::HeadW,
+            key: (ki + 1).wrapping_mul(KEY_MUL),
+            shape: OrigShape::W2(base.head_w.dims()),
+        });
+        ki += 1;
+        dense.push(FSlotSpec {
+            loc: FLoc::HeadB,
+            key: (ki + 1).wrapping_mul(KEY_MUL),
+            shape: OrigShape::B1(base.head_b.dims()[0]),
+        });
+        ki += 1;
+        if blocks == "none" {
+            const QAM_SITE_N: [usize; 8] = [256, 256, 256, 256, 256, 256, 1024, 256];
+            for &site in qam_sites {
+                dense.push(FSlotSpec {
+                    loc: FLoc::Qam(site, 0),
+                    key: (ki + 1).wrapping_mul(KEY_MUL),
+                    shape: OrigShape::B1(QAM_SITE_N[site]),
+                });
+                ki += 1;
+                dense.push(FSlotSpec {
+                    loc: FLoc::Qam(site, 1),
+                    key: (ki + 1).wrapping_mul(KEY_MUL),
+                    shape: OrigShape::B1(QAM_SITE_N[site]),
+                });
+                ki += 1;
+            }
+        }
+        return (lora, dense);
+    }
     for j in 0..depths {
         for which in 0..F_WHICH {
             let dims = floc_get4(base, j, which).dims();
@@ -1713,6 +1835,172 @@ fn es_forward_factored(
         .div_scalar(t as f32) // [C, 10]（时间平均）
 }
 
+/// 无卷积前向（--blocks none）：块内六个 1×1 conv 全部恒等直连，
+/// 注意力核直接作用于 SPS 特征。槽布局：lora[0]=HeadW；dense[0]=HeadB，
+/// dense[1..]=QAM 扰动。可训练自由度 = head + QAM。
+#[allow(clippy::too_many_arguments)]
+fn es_forward_noconv(
+    images: Tensor<B, 5>,
+    base: &SdtWeights<B>,
+    f: &ChunkFactors,
+    cfg: &SdtConfig,
+    relax_ssa: bool,
+    relax_mlp: bool,
+    beta: f32,
+    qam: Option<&QamRun<B>>,
+) -> Tensor<B, 2> {
+    let t = images.dims()[0];
+    let c = images.dims()[1];
+    let lif = |x: Tensor<B, 5>, site: usize, th: f64| -> Tensor<B, 5> {
+        match qam.and_then(|q| q.th5(site)) {
+            Some(th_t) => lif_seq_bth(x, th_t, if relax_ssa { Some(beta as f64) } else { None }),
+            None => {
+                if relax_ssa {
+                    lif_seq_relaxed(x, th, beta as f64)
+                } else {
+                    lif_seq(x, th)
+                }
+            }
+        }
+    };
+    let lif_mlp = |x: Tensor<B, 5>, site: usize, th: f64| -> Tensor<B, 5> {
+        match qam.and_then(|q| q.th5(site)) {
+            Some(th_t) => lif_seq_bth(x, th_t, if relax_mlp { Some(beta as f64) } else { None }),
+            None => {
+                if relax_mlp {
+                    lif_seq_relaxed(x, th, beta as f64)
+                } else {
+                    lif_seq(x, th)
+                }
+            }
+        }
+    };
+    let lif4 = |x: Tensor<B, 4>, site: usize, th: f64| -> Tensor<B, 4> {
+        match qam.and_then(|q| q.th4(site)) {
+            Some(th_t) => lif_seq_bth(x, th_t, if relax_mlp { Some(beta as f64) } else { None }),
+            None => {
+                if relax_mlp {
+                    lif_seq_relaxed(x, th, beta as f64)
+                } else {
+                    lif_seq(x, th)
+                }
+            }
+        }
+    };
+
+    let mut x = forward_sps(images, base, cfg);
+    let heads = cfg.num_heads;
+    for _j in 0..base.blk.len() {
+        let d = x.dims();
+        let (_t, _b, ch, hh, ww) = (d[0], d[1], d[2], d[3], d[4]);
+        let head_dim = ch / heads;
+
+        // xs 位点 0；q/k/v 恒等（无 conv 投影）
+        let xs = {
+            let xin = match qam.and_then(|q| q.m(0)) {
+                Some(m) => x.clone() * m.reshape([1, c, 256, 1, 1]),
+                None => x.clone(),
+            };
+            lif(xin, 0, 1.0)
+        };
+        let identity = x;
+        let qh = reshape_heads(xs.clone(), heads, head_dim);
+        let kh = reshape_heads(xs.clone(), heads, head_dim);
+        let vh = reshape_heads(xs, heads, head_dim);
+
+        let kv = (kh * vh.clone()).sum_dim(3);
+        let kv_spike = {
+            let kin = match qam.and_then(|q| q.m(4)) {
+                Some(m) => kv * m.reshape([1, c, heads, 1, head_dim]),
+                None => kv,
+            };
+            lif(kin, 4, 0.5)
+        };
+        let xattn = qh * kv_spike;
+        let xo = unshape_heads(xattn, heads, head_dim, hh, ww);
+        let ssa_out = xo + identity; // proj 恒等
+
+        // MLP：fc1/fc2 恒等
+        let identity2 = ssa_out.clone();
+        let x1 = {
+            let xin = match qam.and_then(|q| q.m(5)) {
+                Some(m) => ssa_out * m.reshape([1, c, 256, 1, 1]),
+                None => ssa_out,
+            };
+            lif_mlp(xin, 5, 1.0)
+        };
+        let x2 = {
+            let xin = match qam.and_then(|q| q.m(6)) {
+                Some(m) => x1 * m.reshape([1, c, 256, 1, 1]),
+                None => x1,
+            };
+            lif_mlp(xin, 6, 1.0)
+        };
+        x = x2 + identity2;
+    }
+
+    // head：与 conv 版相同（lora[0]=head 权重噪声，dense[0]=head 偏置噪声）
+    let fd = x.dims();
+    let (t, cb, ch) = (fd[0], fd[1], fd[2]);
+    let feat = x
+        .reshape([t, cb, ch, fd[3] * fd[4]])
+        .sum_dim(3)
+        .div_scalar((fd[3] * fd[4]) as f32);
+    let feat = match qam.and_then(|q| q.m(7)) {
+        Some(m) => feat * m.reshape([1, c, ch, 1]),
+        None => feat,
+    };
+    let feat_spike = lif4(feat, 7, 1.0);
+    let f3 = feat_spike.permute([1, 0, 2, 3]).reshape([c, t, ch]); // [C, T, 256]
+    let (a_h, b_h) = &f.lora[0];
+    let head_w2 = base.head_w.clone();
+    let base_h = f3
+        .clone()
+        .reshape([cb * t, ch])
+        .matmul(head_w2.transpose())
+        .reshape([cb, t, cfg.num_classes]);
+    let yn_h = f3.matmul(b_h.clone().swap_dims(1, 2)).matmul(a_h.clone());
+    let hb = flatten_slot(&OrigShape::B1(cfg.num_classes), &base.head_b);
+    let bias3 = (hb.reshape([1, cfg.num_classes]) + f.dense[0].clone()).reshape([c, 1, cfg.num_classes]);
+    let logits3 = base_h + yn_h + bias3;
+    logits3.sum_dim(1).squeeze::<2>().div_scalar(t as f32)
+}
+
+/// 纯线性探针前向（--blocks probe）：SPS → 时间/空间均值池化 → 线性 head。
+/// 无 LIF、无块、无 QAM；槽布局：lora[0]=HeadW，dense[0]=HeadB。
+/// 池化消去 H×W（ 与预训练 head 的输入语义一致：mean_pool @ W ）。
+fn es_forward_probe(
+    images: Tensor<B, 5>,
+    base: &SdtWeights<B>,
+    f: &ChunkFactors,
+    cfg: &SdtConfig,
+) -> Tensor<B, 2> {
+    let t = images.dims()[0];
+    let c = images.dims()[1];
+    let x = forward_sps(images, base, cfg);
+    let fd = x.dims();
+    let (tt, cb, ch) = (fd[0], fd[1], fd[2]);
+    let feat = x
+        .reshape([tt, cb, ch, fd[3] * fd[4]])
+        .sum_dim(3)
+        .div_scalar((fd[3] * fd[4]) as f32); // [T, C, 256]
+    let f3 = feat
+        .permute([1, 0, 2, 3])
+        .reshape([c, tt, ch]); // [C, T, 256]（feat 为 rank-4 [T,C,256,1]）
+    let (a_h, b_h) = &f.lora[0];
+    let head_w2 = base.head_w.clone();
+    let base_h = f3
+        .clone()
+        .reshape([cb * tt, ch])
+        .matmul(head_w2.transpose())
+        .reshape([cb, tt, cfg.num_classes]);
+    let yn_h = f3.matmul(b_h.clone().swap_dims(1, 2)).matmul(a_h.clone());
+    let hb = flatten_slot(&OrigShape::B1(cfg.num_classes), &base.head_b);
+    let bias3 = (hb.reshape([1, cfg.num_classes]) + f.dense[0].clone()).reshape([c, 1, cfg.num_classes]);
+    let logits3 = base_h + yn_h + bias3;
+    logits3.sum_dim(1).squeeze::<2>().div_scalar(tt as f32)
+}
+
 /// factored 主参数列表（lora 13 槽在前、dense 13 槽+QAM 槽在后，顺序与 factored_slots 一致）
 fn factored_params2d(base: &SdtWeights<B>, lora: &[FSlotSpec], dense: &[FSlotSpec], device: &Dev) -> Vec<Tensor<B, 2>> {
     let mut out = Vec::new();
@@ -1844,17 +2132,23 @@ pub fn run_train_es_factored(args: EsArgs) {
     // ---- 槽位与主参数 ----
     // QAM 位点（ES_MANIFOLD §12.3 位点深度律优先级）：head=feat 单位点（最高信号），
     // ssa=xs/q/k/v/kv，all=全部 8 位点；m 按位点类型跨 block 共享
-    let qam_sites: Vec<usize> = match args.qam.as_str() {
-        "off" => Vec::new(),
-        "learnable" => match args.qam_sites.as_str() {
-            "head" => vec![7],
-            "ssa" => vec![0, 1, 2, 3, 4],
-            "all" => vec![0, 1, 2, 3, 4, 5, 6, 7],
-            other => panic!("未知 --qam-sites: {other}（可选 head|ssa|all）"),
-        },
-        other => panic!("未知 --qam: {other}（可选 off|learnable）"),
+    // probe 模式无 LIF，QAM 无处作用 → 强制关闭
+    let probe_mode = args.blocks == "probe";
+    let qam_sites: Vec<usize> = if probe_mode {
+        Vec::new()
+    } else {
+        match args.qam.as_str() {
+            "off" => Vec::new(),
+            "learnable" => match args.qam_sites.as_str() {
+                "head" => vec![7],
+                "ssa" => vec![0, 1, 2, 3, 4],
+                "all" => vec![0, 1, 2, 3, 4, 5, 6, 7],
+                other => panic!("未知 --qam-sites: {other}（可选 head|ssa|all）"),
+            },
+            other => panic!("未知 --qam: {other}（可选 off|learnable）"),
+        }
     };
-    let (lora_slots, dense_slots) = factored_slots(&base, cfg.depths, &qam_sites, &[]);
+    let (lora_slots, dense_slots) = factored_slots(&base, cfg.depths, &qam_sites, &[], &args.blocks);
     let mut params2d = factored_params2d(&base, &lora_slots, &dense_slots, device);
     let qam_slot_base = lora_slots.len() + dense_slots.len() - 2 * qam_sites.len(); // 第一个 QAM 槽在 params2d 的下标
     let all_shapes: Vec<OrigShape> = lora_slots
@@ -1937,6 +2231,9 @@ pub fn run_train_es_factored(args: EsArgs) {
 
         // σ_slot 每 epoch 重算（随参数演化自适应）
         // QAM 槽用固定尺度（初始近常数 std≈0，std 口径会退化为 0）：σ·c，c_a=0.1/c_φ=0.5
+        // freeze_lora：块卷积权重槽（BlkW = lora[0..nl-1]）σ=0（head 槽保留）；
+        // none/probe 模式 lora 只有 head 槽 → freeze 无对象
+        let nl_conv = if args.blocks == "conv" { lora_slots.len() - 1 } else { 0 };
         let mut sigma_lora = Vec::with_capacity(lora_slots.len());
         let mut sigma_dense = Vec::with_capacity(dense_slots.len());
         for (i, p) in params2d.iter().enumerate() {
@@ -1946,6 +2243,8 @@ pub fn run_train_es_factored(args: EsArgs) {
             let s = if i >= qam_slot_base {
                 let which = (i - qam_slot_base) % 2;
                 args.sigma * if which == 0 { 0.1 } else { 0.5 }
+            } else if args.freeze_lora && i < nl_conv {
+                0.0
             } else {
                 args.sigma * var.sqrt()
             };
@@ -2042,7 +2341,12 @@ pub fn run_train_es_factored(args: EsArgs) {
             // S6：relax-scope=ssa 时 MLP/head 位点保持硬 LIF
             let relax_fwd = args.relax && (beta_t < 16.0 || !args.hard_at_16);
             let relax_mlp = relax_fwd && args.relax_scope != "ssa";
-            let logits = es_forward_factored(images, &base, &factors, &cfg, relax_fwd, relax_mlp, beta_t, qam_run.as_ref()); // [C, 10]
+            let logits = match args.blocks.as_str() {
+                "conv" => es_forward_factored(images, &base, &factors, &cfg, relax_fwd, relax_mlp, beta_t, qam_run.as_ref()), // [C, 10]
+                "none" => es_forward_noconv(images, &base, &factors, &cfg, relax_fwd, relax_mlp, beta_t, qam_run.as_ref()),
+                "probe" => es_forward_probe(images, &base, &factors, &cfg),
+                other => panic!("未知 --blocks: {other}"),
+            }; // [C, 10]
             let logsm = log_softmax2(logits.clone());
             // S7 优化：one_hot 构造+乘法 → gather（raw[c] = logsm[c, targets[c]]，逐位一致）
             let raw = logsm
@@ -2086,7 +2390,18 @@ pub fn run_train_es_factored(args: EsArgs) {
             .into_iter()
             .map(|g| g.mul_scalar(scale))
             .collect();
+        // freeze_lora：AdamW 的 wd 会衰减零梯度槽——步前保存、步后恢复，保证严格冻结
+        let frozen_saved: Option<Vec<Tensor<B, 2>>> = if args.freeze_lora && nl_conv > 0 {
+            Some(params2d[..nl_conv].to_vec())
+        } else {
+            None
+        };
         optim.step(&mut params2d, &grads);
+        if let Some(saved) = frozen_saved {
+            for (i, s) in saved.into_iter().enumerate() {
+                params2d[i] = s;
+            }
+        }
         write_back_factored(&mut base, &lora_slots, &dense_slots, &params2d);
 
         // ---- 5) epoch 末 sync + cleanup ----
@@ -2118,7 +2433,7 @@ pub fn run_train_es_factored(args: EsArgs) {
                 }
                 Some(QamWeights { sites, vth: Vec::new() })
             };
-            let val_top1 = eval_es(&base, qam_eval.as_ref(), &data, 256, args.time_steps, &cfg); // S9：批 64→256
+            let val_top1 = eval_es_arch(&base, qam_eval.as_ref(), &data, 256, args.time_steps, &cfg, &args.blocks); // S9：批 64→256
             if val_top1 > best_val {
                 best_val = val_top1;
             }
@@ -2247,7 +2562,7 @@ pub fn run_train_mixed(args: MixedArgs) {
         other => panic!("未知 --qam: {other}"),
     };
     let vth_sites: Vec<usize> = vec![0, 1, 2, 3, 4, 5, 6, 7]; // 全位点标量阈值
-    let (lora_slots, dense_slots) = factored_slots(&base, cfg.depths, &qam_sites, &vth_sites);
+    let (lora_slots, dense_slots) = factored_slots(&base, cfg.depths, &qam_sites, &vth_sites, "conv");
     let mut es_params: Vec<Tensor<B, 2>> =
         factored_params2d(&base, &lora_slots, &dense_slots, device);
     let nd_bias = dense_slots.len() - qam_sites.len() * 2 - vth_sites.len(); // 前 13 个 = 真实偏置槽
