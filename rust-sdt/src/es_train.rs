@@ -1867,9 +1867,6 @@ pub fn run_train_es_factored(args: EsArgs) {
 
         // σ_slot 每 epoch 重算（随参数演化自适应）
         // QAM 槽用固定尺度（初始近常数 std≈0，std 口径会退化为 0）：σ·c，c_a=0.1/c_φ=0.5
-        // 且随 lr 调度同步衰减（lr_frac ∈ [lr_min_frac, 1]）——Run-3 实测固定尺度
-        // 在尾段（lr→0.002）仍全强度注入扰动，是尾段回落（15.00%）的可疑来源
-        let lr_frac = (lr_t / args.lr) as f32;
         let mut sigma_lora = Vec::with_capacity(lora_slots.len());
         let mut sigma_dense = Vec::with_capacity(dense_slots.len());
         for (i, p) in params2d.iter().enumerate() {
@@ -1878,7 +1875,7 @@ pub fn run_train_es_factored(args: EsArgs) {
             let var = (p.clone().powf_scalar(2.0).sum().into_scalar() / n as f32 - mean * mean).max(0.0);
             let s = if i >= qam_slot_base {
                 let which = (i - qam_slot_base) % 2;
-                args.sigma * if which == 0 { 0.1 } else { 0.5 } * lr_frac
+                args.sigma * if which == 0 { 0.1 } else { 0.5 }
             } else {
                 args.sigma * var.sqrt()
             };
