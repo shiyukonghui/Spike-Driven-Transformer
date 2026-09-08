@@ -265,11 +265,22 @@ pub fn unshape_heads<B: Backend>(
 pub struct QamWeights<B: Backend> {
     /// (site_id, a [n], phi [n])，n = 该位点神经元数
     pub sites: Vec<(usize, Tensor<B, 1>, Tensor<B, 1>)>,
+    /// 可学习阈值（混合估计器 §13）：(site_id, v_th) CPU 标量；缺省位点用默认阈值
+    pub vth: Vec<(usize, f64)>,
 }
 
 impl<B: Backend> QamWeights<B> {
     pub fn site(&self, id: usize) -> Option<(&Tensor<B, 1>, &Tensor<B, 1>)> {
         self.sites.iter().find(|(sid, _, _)| *sid == id).map(|(_, a, p)| (a, p))
+    }
+
+    /// 位点阈值：可学习 v_th 优先，否则默认（1.0 / kv 0.5）
+    pub fn th_of(&self, site: usize, default: f64) -> f64 {
+        self.vth
+            .iter()
+            .find(|(sid, _)| *sid == site)
+            .map(|(_, th)| *th)
+            .unwrap_or(default)
     }
 }
 
@@ -307,8 +318,8 @@ pub fn forward_ssa<B: Backend>(
     let heads = cfg.num_heads;
     let head_dim = c / heads;
 
-    // shortcut LIF（xs 位点 0）
-    let xs = lif(qam_apply5(x.clone(), qam, 0), 1.0);
+    // shortcut LIF（xs 位点 0；可学习阈值 th_of(site, 默认)）
+    let xs = lif(qam_apply5(x.clone(), qam, 0), qam.map_or(1.0, |q| q.th_of(0, 1.0)));
     let identity = x; // 残差取 LIF 之前的输入（与 PyTorch 一致）
 
     // q/k/v conv
@@ -317,9 +328,9 @@ pub fn forward_ssa<B: Backend>(
     let xv = conv_merge_tb(xs, &bw.v);
 
     // q/k/v LIF（位点 1/2/3）
-    let q = lif(qam_apply5(xq, qam, 1), 1.0);
-    let k = lif(qam_apply5(xk, qam, 2), 1.0);
-    let v = lif(qam_apply5(xv, qam, 3), 1.0);
+    let q = lif(qam_apply5(xq, qam, 1), qam.map_or(1.0, |q| q.th_of(1, 1.0)));
+    let k = lif(qam_apply5(xk, qam, 2), qam.map_or(1.0, |q| q.th_of(2, 1.0)));
+    let v = lif(qam_apply5(xv, qam, 3), qam.map_or(1.0, |q| q.th_of(3, 1.0)));
 
     // 变形为 [T, B, heads, N, head_dim]
     let qh = reshape_heads(q, heads, head_dim);
@@ -332,12 +343,13 @@ pub fn forward_ssa<B: Backend>(
     eprintln!("[调试] kv dims = {:?}, qh dims = {:?}", kv.dims(), qh.dims());
     // kv_sum 直接过 LIF(0.5)（PyTorch 只调用 talking_heads_lif，不做 Conv1d 混合）
     // kv 位点 4：m [heads·hd] reshape 相乘
+    let kv_th = qam.map_or(0.5, |q| q.th_of(4, 0.5));
     let kv_spike = match qam.and_then(|q| q.site(4)) {
         Some((a, p)) => {
             let m = (a.clone() + 1.0) * p.clone().cos();
-            lif(qam_mul_kv(kv, &m), 0.5)
+            lif(qam_mul_kv(kv, &m), kv_th)
         }
-        None => lif(kv, 0.5),
+        None => lif(kv, kv_th),
     };
 
     // x = q ⊙ kv（广播相乘）
@@ -362,11 +374,11 @@ pub fn forward_mlp<B: Backend>(
     let identity = x.clone();
     // fc1：LIF -> conv（无残差：hidden = dim*mlp_ratio != dim）
     // x1 位点 5（输入 = ssa_out，256）
-    let x1 = lif(qam_apply5(x, qam, 5), 1.0);
+    let x1 = lif(qam_apply5(x, qam, 5), qam.map_or(1.0, |q| q.th_of(5, 1.0)));
     let x1c = conv_merge_tb(x1, &bw.fc1);
     // fc2：LIF -> conv，然后 x + identity
     // x2 位点 6（输入 = fc1 conv 输出，1024）
-    let x2 = lif(qam_apply5(x1c, qam, 6), 1.0);
+    let x2 = lif(qam_apply5(x1c, qam, 6), qam.map_or(1.0, |q| q.th_of(6, 1.0)));
     let x2c = conv_merge_tb(x2, &bw.fc2);
     let out = x2c + identity;
     out
@@ -413,7 +425,7 @@ pub fn forward_full<B: Backend>(
         }
         None => feat,
     };
-    let feat_spike = lif_seq(feat, 1.0);
+    let feat_spike = lif_seq(feat, qam.map_or(1.0, |q| q.th_of(7, 1.0)));
 
     // head linear：[T*B,C] x [C,num_classes] -> [T*B,num_classes]
     let logits_tb = feat_spike

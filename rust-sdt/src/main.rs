@@ -166,6 +166,61 @@ enum Command {
         #[arg(long, default_value = "head")]
         qam_sites: String,
     },
+    /// 混合估计器（ES_MANIFOLD §13）：SGD（W/b 精确梯度）+ ES（v_th 8 标量 + QAM 低维槽）
+    TrainMixed {
+        /// 训练轮数
+        #[arg(long, default_value_t = 100)]
+        epochs: u32,
+        /// 数据目录（含 cifar10_data.npz）
+        #[arg(long, default_value = "data")]
+        data_dir: String,
+        #[arg(long, default_value_t = 79)]
+        seed: u64,
+        /// 初始化权重 NPZ（校准后 init）
+        #[arg(long)]
+        weights: Option<String>,
+        #[arg(long, default_value_t = 4)]
+        time_steps: usize,
+        #[arg(long, default_value_t = false)]
+        no_calibrate: bool,
+        /// SGD 批大小
+        #[arg(long, default_value_t = 128)]
+        batch_size: usize,
+        /// SGD 学习率（cosine 到 0.1×）
+        #[arg(long, default_value_t = 0.01)]
+        lr_sgd: f64,
+        #[arg(long, default_value_t = 0.1)]
+        lr_sgd_min_frac: f64,
+        /// SGD 动量
+        #[arg(long, default_value_t = 0.9)]
+        sgd_momentum: f64,
+        /// ES 候选数（= 训练集）
+        #[arg(long, default_value_t = 8000)]
+        es_pop: usize,
+        #[arg(long, default_value_t = 128)]
+        es_chunk: usize,
+        /// ES 扰动基准尺度
+        #[arg(long, default_value_t = 0.5)]
+        sigma_es: f32,
+        /// ES 更新学习率
+        #[arg(long, default_value_t = 0.02)]
+        lr_es: f32,
+        #[arg(long, default_value_t = 4.0)]
+        beta: f32,
+        /// β 退火周期（×2，上限 16）；0 = 固定
+        #[arg(long, default_value_t = 25)]
+        beta_anneal_every: u32,
+        /// QAM："off" | "learnable"
+        #[arg(long, default_value = "learnable")]
+        qam: String,
+        /// QAM 位点："head" | "ssa" | "all"
+        #[arg(long, default_value = "ssa")]
+        qam_sites: String,
+        #[arg(long, default_value_t = 5)]
+        validate_every: u32,
+        #[arg(long, default_value = "artifacts/train_mixed.csv")]
+        csv_out: String,
+    },
 }
 
 fn main() {
@@ -261,6 +316,51 @@ fn main() {
                 hard_at_16,
                 qam,
                 qam_sites,
+            });
+        }
+        Command::TrainMixed {
+            epochs,
+            data_dir,
+            seed,
+            weights,
+            time_steps,
+            no_calibrate,
+            batch_size,
+            lr_sgd,
+            lr_sgd_min_frac,
+            sgd_momentum,
+            es_pop,
+            es_chunk,
+            sigma_es,
+            lr_es,
+            beta,
+            beta_anneal_every,
+            qam,
+            qam_sites,
+            validate_every,
+            csv_out,
+        } => {
+            crate::es_train::run_train_mixed(crate::es_train::MixedArgs {
+                epochs,
+                data_dir,
+                seed,
+                weights,
+                time_steps,
+                no_calibrate,
+                batch_size,
+                lr_sgd,
+                lr_sgd_min_frac,
+                sgd_momentum,
+                es_pop,
+                es_chunk,
+                sigma_es,
+                lr_es,
+                beta,
+                beta_anneal_every,
+                qam,
+                qam_sites,
+                validate_every,
+                csv_out,
             });
         }
     }

@@ -118,6 +118,64 @@ pub fn lif_seq_relaxed<B: Backend, const D: usize>(
     }
     out
 }
+
+// ---- 张量阈值 LIF（混合估计器：逐候选可学习阈值 v_th，ES_MANIFOLD §13）----
+// 阈值以与输入同秩的张量广播传入（形如 [1, C, 1, 1, 1]），
+// 使得 ±σ·ε 的阈值扰动可以逐候选不同（ES 对 v_th 的一阶信号来源）。
+
+/// 张量阈值硬 LIF 单步：前向精确 heaviside + SG_ALPHA 代理反向（与 lif_step 同语义）
+pub fn lif_step_bth<B: Backend, const D: usize>(
+    v_prev: Tensor<B, D>,
+    x: Tensor<B, D>,
+    threshold: Tensor<B, D>,
+) -> (Tensor<B, D>, Tensor<B, D>) {
+    let h = v_prev.clone() + (x - v_prev.clone()) / TAU;
+    // heaviside(h >= thr)：mask 不产生梯度，sg 提供代理梯度
+    let xh = h.clone() - threshold.clone();
+    let sg = burn::tensor::activation::sigmoid(xh.clone() * SG_ALPHA);
+    let sg_d = sg.clone().detach();
+    let step = Tensor::<B, D>::ones(xh.shape(), &xh.device())
+        .mask_fill(xh.lower_equal_elem(0.0), 0.0f32)
+        .detach();
+    let spike = sg - sg_d + step;
+    let one_minus_spike = (1.0f32 - spike.clone()).detach();
+    let v_new = one_minus_spike * h;
+    (spike, v_new)
+}
+
+/// 张量阈值松弛 LIF 单步：s = σ(β(h−thr))
+pub fn lif_step_relaxed_bth<B: Backend, const D: usize>(
+    v_prev: Tensor<B, D>,
+    x: Tensor<B, D>,
+    threshold: Tensor<B, D>,
+    beta: f64,
+) -> (Tensor<B, D>, Tensor<B, D>) {
+    let h = v_prev.clone() + (x - v_prev.clone()) / TAU;
+    let s = burn::tensor::activation::sigmoid((h.clone() - threshold.clone()) * beta);
+    let v_new = (1.0f32 - s.clone()) * h;
+    (s, v_new)
+}
+
+/// 张量阈值多时间步 LIF：beta=Some 时松弛读出，None 时硬脉冲（与 lif_seq 同语义）
+pub fn lif_seq_bth<B: Backend, const D: usize>(
+    x: Tensor<B, D>,
+    threshold: Tensor<B, D>,
+    beta: Option<f64>,
+) -> Tensor<B, D> {
+    let t = x.dims()[0];
+    let mut v = Tensor::zeros(x.clone().slice([0..1]).shape(), &x.device());
+    let mut out = Tensor::zeros(x.shape(), &x.device());
+    for i in 0..t {
+        let xt = x.clone().slice([i..i + 1]);
+        let (s, v_new) = match beta {
+            Some(b) => lif_step_relaxed_bth(v, xt, threshold.clone(), b),
+            None => lif_step_bth(v, xt, threshold.clone()),
+        };
+        v = v_new;
+        out = out.slice_assign([i..i + 1], s);
+    }
+    out
+}
 /// SPS 中的 maxpool：kernel=3, stride=2, padding=1（ceil_mode=False）。
 /// 输入 [B, C, H, W]，输出 [B, C, (H+2-3)/2+1, ...]（floor 语义与 PyTorch 一致）。
 pub fn maxpool2d_3x3_s2<B: Backend>(x: Tensor<B, 4>) -> Tensor<B, 4> {

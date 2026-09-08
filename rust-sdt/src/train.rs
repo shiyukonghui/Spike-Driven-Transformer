@@ -543,7 +543,7 @@ pub fn static_calibrate(
 /// 优化器参数用泛型 `O: Optimizer<...>`：SgdConfig::init 返回的
 /// `simple::adaptor::OptimizerAdaptor` 未被公开 re-export（E0603），
 /// 但 `burn::optim::Optimizer` trait 是公开的，按 trait 泛型传入即可解耦具体类型。
-fn train_epoch<O>(
+pub fn train_epoch<O>(
     model: &mut TrainSdt<AutodiffBackend>,
     optim: &mut O,
     data: &Cifar10Npz,
@@ -553,6 +553,7 @@ fn train_epoch<O>(
     lr: f64,
     device: &AutodiffDevice,
     cfg: &SdtConfig,
+    qam: Option<&crate::model::QamWeights<AutodiffBackend>>,
 ) -> (f64, usize)
 where
     O: burn::optim::Optimizer<
@@ -572,8 +573,10 @@ where
         let bs = chunk.len();
 
         // 前向（复用统一前向；to_weights 产出 autodiff 后端的只读权重视图）
+        // qam（混合估计器）：可学习调制 m 与可学习阈值 v_th 由 ES 侧维护，
+        // SGD 前向使用其当前值（对 W/b 的梯度仍精确）
         let weights = model.to_weights();
-        let logits = forward_full(images, &weights, cfg, None);
+        let logits = forward_full(images, &weights, cfg, qam);
 
         // 交叉熵损失（[B] -> 取均值得到标量）
         let loss = loss_fn.forward(logits, targets);
@@ -821,6 +824,7 @@ pub fn run_train_with_args(args: TrainArgs) {
             args.lr,
             &device,
             &cfg,
+            None,
         );
         let val_top1 = eval_top1(&model, &data, args.batch_size, t, &device, &cfg);
         println!(
@@ -853,7 +857,7 @@ pub fn run_train_with_args(args: TrainArgs) {
 /// 注册图节点，而无 backward 消费时这些节点（及其 GPU 缓冲句柄）不会被释放
 /// ——实测 62 批 eval 累积 ~26GB 激活直至 OOM。转回内层后端后，中间张量
 /// 走普通 drop 路径（复用正常）。
-fn to_wgpu_weights(w: &SdtWeights<AutodiffBackend>) -> SdtWeights<BackendAdapter> {
+pub fn to_wgpu_weights(w: &SdtWeights<AutodiffBackend>) -> SdtWeights<BackendAdapter> {
     fn conv_wgpu(c: &crate::model::ConvLayer<AutodiffBackend>) -> crate::model::ConvLayer<BackendAdapter> {
         crate::model::ConvLayer {
             w: c.w.clone().inner(),
@@ -892,7 +896,7 @@ fn to_wgpu_weights(w: &SdtWeights<AutodiffBackend>) -> SdtWeights<BackendAdapter
 /// burn 0.18 中 `Autodiff<B>` 的张量可用 `Tensor::from_inner`（autodiff 扩展的公开方法）
 /// 从 inner 后端（wgpu）张量构造；设备同型（Autodiff<B>::Device == B::Device），
 /// 张量数据不发生拷贝，仅包装为 autodiff 叶节点。
-fn to_autodiff_weights(w: &SdtWeights<BackendAdapter>) -> SdtWeights<AutodiffBackend> {
+pub fn to_autodiff_weights(w: &SdtWeights<BackendAdapter>) -> SdtWeights<AutodiffBackend> {
     // 单个卷积层：逐张量转换
     fn conv_ad(c: &crate::model::ConvLayer<BackendAdapter>) -> crate::model::ConvLayer<AutodiffBackend> {
         crate::model::ConvLayer {
@@ -1192,7 +1196,7 @@ pub fn run_mem_probe(iters: u32) {
             .init::<AutodiffBackend, TrainSdt<AutodiffBackend>>();
         let order: Vec<usize> = (0..iters as usize * b).collect();
         let (loss, steps) = train_epoch(
-            &mut model, &mut optim, &data, &order, b, t, 0.01, &device, &cfg,
+            &mut model, &mut optim, &data, &order, b, t, 0.01, &device, &cfg, None,
         );
         println!("== stage4 train_epoch done: loss={loss:.4} steps={steps} ==");
         return;
