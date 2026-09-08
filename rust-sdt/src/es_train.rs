@@ -630,6 +630,11 @@ pub struct EsArgs {
     /// 冻结卷积权重槽（σ_lora=0，仅 "conv" 模式有效）：只训 bias+head+QAM——
     /// 检验“深槽只注噪不产信号”的稀释假设
     pub freeze_lora: bool,
+    /// 逐候选零噪声锚点（控制变量，X1）：每 epoch 先无噪声评估当前 θ 在全部
+    /// 训练图上的 loglik b₀(x)，候选 raw′ₙ = rawₙ − b₀(xₙ) 再 z-score——
+    /// 图像难度项逐点扣除，z 尺度从数据方差塌缩为响应方差
+    /// （GMD 核化均值偏移的锚点项 + EggRollBS 基线扣除的样本级推广）
+    pub baseline_zero: bool,
 }
 
 /// 内层 wgpu 设备引用
@@ -757,6 +762,107 @@ fn eval_es_arch(
     <B as burn::tensor::backend::Backend>::sync(device).expect("eval 同步失败");
     <B as burn::tensor::backend::Backend>::memory_cleanup(device);
     correct as f64 / n as f64 * 100.0
+}
+
+/// 零噪声因子（与槽布局匹配的全零张量）——无噪声锚点前向用
+fn zero_factors(
+    lora_slots: &[FSlotSpec],
+    dense_slots: &[FSlotSpec],
+    rank: usize,
+    c: usize,
+    device: &Dev,
+) -> ChunkFactors {
+    let lora = lora_slots
+        .iter()
+        .map(|s| {
+            let [a, b] = s.shape.flat2d();
+            (
+                Tensor::<B, 3>::zeros([c, rank, a], device),
+                Tensor::<B, 3>::zeros([c, rank, b], device),
+            )
+        })
+        .collect();
+    let dense = dense_slots
+        .iter()
+        .map(|s| {
+            let n = s.shape.flat2d()[0] * s.shape.flat2d()[1];
+            Tensor::<B, 2>::zeros([c, n], device)
+        })
+        .collect();
+    ChunkFactors { lora, dense }
+}
+
+/// QamWeights → 零 delta QamRun（评估口径：m = (1+a)cos φ 基值、v_th 基值）
+fn qam_run_zero(c: usize, qam_eval: Option<&QamWeights<B>>, device: &Dev) -> Option<QamRun<B>> {
+    let q = qam_eval?;
+    let mut sites = Vec::new();
+    for (s, a, p) in &q.sites {
+        let nn = a.dims()[0];
+        let za = Tensor::<B, 2>::zeros([c, nn], device);
+        let zp = Tensor::<B, 2>::zeros([c, nn], device);
+        sites.push((
+            *s,
+            a.clone().reshape([nn, 1]),
+            p.clone().reshape([nn, 1]),
+            za,
+            zp,
+        ));
+    }
+    let vth = q
+        .vth
+        .iter()
+        .map(|(s, v)| (*s, *v, Tensor::<B, 1>::zeros([c], device)))
+        .collect();
+    Some(QamRun { sites, vth })
+}
+
+/// 逐图像零噪声锚点 fitness b₀(x)（控制变量 X1）：
+/// 当前 θ（含当前 QAM 基值 m）无噪声前向，逐图 loglik。
+/// 与训练候选 fitness 同分布口径（同 relax/β/blocks），保证 E[raw′]=E[响应]。
+#[allow(clippy::too_many_arguments)]
+fn zero_noise_anchors(
+    base: &SdtWeights<B>,
+    lora_slots: &[FSlotSpec],
+    dense_slots: &[FSlotSpec],
+    qam_eval: Option<&QamWeights<B>>,
+    data: &Cifar10Npz,
+    cfg: &SdtConfig,
+    blocks: &str,
+    rank: usize,
+    imgs: &[usize],
+    batch: usize,
+    t_steps: usize,
+    relax_fwd: bool,
+    relax_mlp: bool,
+    beta: f32,
+) -> Vec<f32> {
+    let device = es_dev();
+    let mut out = Vec::with_capacity(imgs.len());
+    for chunk in imgs.chunks(batch) {
+        let (images, targets) = data.get_batch(Split::Train, chunk, t_steps, device);
+        let c = chunk.len();
+        let factors = zero_factors(lora_slots, dense_slots, rank, c, device);
+        let qam_run = qam_run_zero(c, qam_eval, device);
+        let logits = match blocks {
+            "conv" => es_forward_factored(images, base, &factors, cfg, relax_fwd, relax_mlp, beta, qam_run.as_ref()),
+            "none" => es_forward_noconv(images, base, &factors, cfg, relax_fwd, relax_mlp, beta, qam_run.as_ref()),
+            "probe" => es_forward_probe(images, base, &factors, cfg),
+            other => panic!("未知 --blocks: {other}"),
+        };
+        let logsm = log_softmax2(logits);
+        let raw = logsm
+            .gather(1, targets.reshape([c, 1]))
+            .reshape([c]);
+        let v: Vec<f32> = raw
+            .into_data()
+            .convert::<f32>()
+            .to_vec::<f32>()
+            .expect("锚点读取失败");
+        out.extend(v);
+        <B as burn::tensor::backend::Backend>::sync(device).expect("锚点逐批同步失败");
+        <B as burn::tensor::backend::Backend>::memory_cleanup(device);
+    }
+    out
 }
 
 /// ES 训练主入口（按 args.mode 分派）
@@ -2270,6 +2376,50 @@ pub fn run_train_es_factored(args: EsArgs) {
         let mut fwd_time = 0.0_f32;
         let n_chunks = args.pop / args.chunk;
         let order_vec: Vec<usize> = order.to_vec();
+        // X1 控制变量锚点：每 epoch 一次无噪声前向（当前 θ + 当前 QAM 基值），
+        // 逐训练图 loglik b₀(x)。relax 口径与候选 fitness 一致（同 relax/β）。
+        let anchors_gpu: Option<Tensor<B, 1>> = if args.baseline_zero {
+            let a_relax_fwd = args.relax && (beta_t < 16.0 || !args.hard_at_16);
+            let a_relax_mlp = a_relax_fwd && args.relax_scope != "ssa";
+            // 当前 QAM 基值（与验证节同构，从 params2d 重建）
+            let qam_eval_anchor = if qam_sites.is_empty() {
+                None
+            } else {
+                let mut sites = Vec::with_capacity(qam_sites.len());
+                for (kk, &site) in qam_sites.iter().enumerate() {
+                    let ia = qam_slot_base + 2 * kk;
+                    let na = params2d[ia].dims()[0];
+                    sites.push((
+                        site,
+                        params2d[ia].clone().reshape([na]),
+                        params2d[ia + 1].clone().reshape([na]),
+                    ));
+                }
+                Some(QamWeights { sites, vth: Vec::new() })
+            };
+            let t_a = std::time::Instant::now();
+            let anchors = zero_noise_anchors(
+                &base, &lora_slots, &dense_slots, qam_eval_anchor.as_ref(), &data, &cfg,
+                &args.blocks, args.rank, &order_vec, 512, args.time_steps,
+                a_relax_fwd, a_relax_mlp, beta_t,
+            );
+            println!(
+                "  [anchor] b₀ mean={:.4} std={:.4}（{:.1}s）",
+                anchors.iter().sum::<f32>() / anchors.len() as f32,
+                {
+                    let m = anchors.iter().sum::<f32>() / anchors.len() as f32;
+                    (anchors.iter().map(|v| (v - m) * (v - m)).sum::<f32>() / anchors.len() as f32).sqrt()
+                },
+                t_a.elapsed().as_secs_f32()
+            );
+            let n_anchor = anchors.len();
+            Some(Tensor::<B, 1>::from_data(
+                burn::tensor::TensorData::new(anchors, [n_anchor]),
+                device,
+            ))
+        } else {
+            None
+        };
         for k in 0..n_chunks {
             // ---- 1) S3：GPU 端因子生成（零 CPU 生成、零 PCIe 上传）----
             let t0 = std::time::Instant::now();
@@ -2334,7 +2484,7 @@ pub fn run_train_es_factored(args: EsArgs) {
                 .reshape([img_slice.len(), 3, 32, 32])
                 .reshape([1, img_slice.len(), 3, 32, 32])
                 .repeat_dim(0, args.time_steps); // [T, C, 3, 32, 32]
-            let targets = lab_t.clone().select(0, idx_t); // [C] Int
+            let targets = lab_t.clone().select(0, idx_t.clone()); // [C] Int
             // S4 优化：β 退火到 16 后切硬 LIF——Run-1（1000ep）实测为训练质量负优化
             // （峰值后衰减回归，机制 = 定理 2/3：硬 fitness 信号只在切换复形上），
             // 故改为 opt-in：默认全程松弛（v4 行为），--hard-at-16 启用硬切换。
@@ -2349,9 +2499,14 @@ pub fn run_train_es_factored(args: EsArgs) {
             }; // [C, 10]
             let logsm = log_softmax2(logits.clone());
             // S7 优化：one_hot 构造+乘法 → gather（raw[c] = logsm[c, targets[c]]，逐位一致）
-            let raw = logsm
+            let mut raw = logsm
                 .gather(1, targets.clone().reshape([img_slice.len(), 1]))
                 .reshape([img_slice.len()]); // [C]
+            // X1 控制变量：raw′ₙ = rawₙ − b₀(xₙ)（逐候选零噪声锚点）
+            if let Some(an) = anchors_gpu.as_ref() {
+                let an_g = an.clone().select(0, idx_t.clone());
+                raw = raw - an_g;
+            }
             let pred = logits.argmax(1).reshape([cand_slice.len()]);
             correct_acc = correct_acc.clone() + pred.equal(targets).float().sum();
             n_used += cand_slice.len();
@@ -2390,6 +2545,12 @@ pub fn run_train_es_factored(args: EsArgs) {
             .into_iter()
             .map(|g| g.mul_scalar(scale))
             .collect();
+        // X4 漂移范数：‖g‖（GMD 平衡点监控——收敛时归零）
+        let gnorm2: f32 = grads
+            .iter()
+            .map(|g| g.clone().powf_scalar(2.0).sum().into_scalar())
+            .sum();
+        let gnorm = gnorm2.sqrt();
         // freeze_lora：AdamW 的 wd 会衰减零梯度槽——步前保存、步后恢复，保证严格冻结
         let frozen_saved: Option<Vec<Tensor<B, 2>>> = if args.freeze_lora && nl_conv > 0 {
             Some(params2d[..nl_conv].to_vec())
@@ -2439,7 +2600,7 @@ pub fn run_train_es_factored(args: EsArgs) {
             }
             val_str = format!("{val_top1:.2}");
             println!(
-                "epoch={}/{}, train_top1={:.2}%, train_loglik={:.4}, val_top1={:.2}%, best_val={:.2}%{}（gen {:.1}s fwd {:.1}s，本轮 {:.1}s，lr={:.5}）",
+                "epoch={}/{}, train_top1={:.2}%, train_loglik={:.4}, val_top1={:.2}%, best_val={:.2}%{}（gen {:.1}s fwd {:.1}s，本轮 {:.1}s，lr={:.5}，‖g‖={:.3}）",
                 epoch + 1, args.epochs, train_top1, train_loglik, val_top1, best_val,
                 if args.relax {
                     if args.relax && (beta_t < 16.0 || !args.hard_at_16) {
@@ -2452,7 +2613,8 @@ pub fn run_train_es_factored(args: EsArgs) {
                 },
                 gen_time, fwd_time,
                 ep_start.elapsed().as_secs_f32(),
-                lr_t
+                lr_t,
+                gnorm
             );
         } else {
             println!(

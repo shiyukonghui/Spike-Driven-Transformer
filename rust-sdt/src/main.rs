@@ -174,6 +174,9 @@ enum Command {
         /// 冻结卷积权重槽（σ=0，仅 conv 模式有效）
         #[arg(long, default_value_t = false)]
         freeze_lora: bool,
+        /// 逐候选零噪声锚点（控制变量 X1）：raw′=raw−b₀(x) 再 z-score
+        #[arg(long, default_value_t = false)]
+        baseline_zero: bool,
     },
     /// 混合估计器（ES_MANIFOLD §13）：SGD（W/b 精确梯度）+ ES（v_th 8 标量 + QAM 低维槽）
     TrainMixed {
@@ -302,6 +305,7 @@ fn main() {
             pair_shared,
             blocks,
             freeze_lora,
+            baseline_zero,
         } => {
             crate::es_train::run_train_es(crate::es_train::EsArgs {
                 epochs,
@@ -331,6 +335,7 @@ fn main() {
                 pair_shared,
                 blocks,
                 freeze_lora,
+                baseline_zero,
             });
         }
         Command::TrainMixed {
