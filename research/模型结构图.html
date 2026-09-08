@@ -1,0 +1,316 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<title>SDT-ES 各方案模型结构图（分支 es-no-conv · 2026-09-09）</title>
+<style>
+  body{font-family:"Segoe UI","Microsoft YaHei",sans-serif;background:#fafafa;color:#263238;margin:0;padding:24px;}
+  h1{font-size:22px;margin:0 0 4px;} h2{font-size:17px;margin:28px 0 6px;border-left:4px solid #4a90d9;padding-left:8px;}
+  .sub{color:#607d8b;font-size:13px;margin-bottom:16px;}
+  .card{background:#fff;border:1px solid #e0e0e0;border-radius:10px;padding:14px 18px;margin-bottom:22px;box-shadow:0 1px 3px rgba(0,0,0,.05);}
+  .badge{display:inline-block;padding:3px 10px;border-radius:12px;font-size:12px;font-weight:600;margin-right:6px;}
+  .b-best{background:#e8f5e9;color:#1b5e20;border:1px solid #a5d6a7;}
+  .b-warn{background:#fff3e0;color:#e65100;border:1px solid #ffcc80;}
+  .b-info{background:#e3f2fd;color:#0d47a1;border:1px solid #90caf9;}
+  .note{font-size:13px;color:#455a64;line-height:1.7;margin-top:8px;}
+  table{border-collapse:collapse;font-size:12.5px;margin-top:8px;}
+  td,th{border:1px solid #cfd8dc;padding:4px 10px;text-align:left;}
+  th{background:#eceff1;}
+  svg{display:block;max-width:100%;height:auto;}
+  .lg{display:inline-block;width:14px;height:14px;border-radius:3px;vertical-align:-2px;margin:0 4px 0 12px;}
+  text{font-family:"Segoe UI","Microsoft YaHei",sans-serif;}
+</style>
+</head>
+<body>
+<h1>SDT-ES 各方案模型结构图</h1>
+<div class="sub">分支 es-no-conv · 数据：CIFAR-10 子集 8000 / 同起点 init / EggRoll factored ES（pop=8000）· 2026-09-09</div>
+<div>
+  <span class="lg" style="background:#eceff1;border:1px solid #90a4ae"></span>冻结（预训练/σ=0）
+  <span class="lg" style="background:#e3f0fb;border:1px solid #4a90d9"></span>LoRA 噪声槽（ES 可训练权重）
+  <span class="lg" style="background:#fffde7;border:1px solid #fbc02d"></span>算子/LIF（不可训练，除非标注）
+  <span class="lg" style="background:#e8f5e9;border:1px solid #7cb342"></span>head（深度 0 可训练）
+  <span class="lg" style="background:#fff3e0;border:1px solid #f5a623;border-radius:50%"></span>QAM 调制位点 m⊗
+  <span class="lg" style="border:1px dashed #9e9e9e"></span>恒等直连/残差
+</div>
+
+<div class="card"><h2>图 1 · conv 全训练（标准 factored ES，Run-2/3/5 配方）</h2>
+<div><span class="badge b-info">100ep 14.35%（无QAM）</span><span class="badge b-info">100ep 17.15%（+QAM ssa，E0）</span><span class="badge b-warn">全量 60ep 18.24%（Run-5）</span></div>
+<div id="d1"></div>
+<div class="note">可训练槽 26（12 conv LoRA + 13 bias + head）+ QAM 10（ssa）。conv 槽位于 LIF 之后（位点深度律实测 |cos| 0.035~0.35）——
+因子实验表明这些深槽<b>只注入响应方差、不产生可用梯度</b>，并通过共享 z-score 稀释 head 信号（见 05 文档四·五节）。</div>
+</div>
+
+<div class="card"><h2>图 2 · conv + 冻结卷积槽（--freeze-lora）</h2>
+<div><span class="badge b-info">100ep 16.95%（无QAM）</span><span class="badge b-best">100ep 17.60%（+QAM ssa）</span></div>
+<div id="d2"></div>
+<div class="note">结构不变，12 个 conv LoRA 槽 σ=0（🔒 冻结在预训练值，步后恢复防 wd 漂移）。可训练槽 24（13 bias + head + QAM）。
+对比图 1：<b>冻结深槽后 head 学习回升</b>（17.60 &gt; 17.15）——深槽的噪声稀释被移除。</div>
+</div>
+
+<div class="card"><h2>图 3 · none 恒等直连（--blocks none）</h2>
+<div><span class="badge b-warn">10ep 11.25%（+QAM ssa；100ep 未跑）</span></div>
+<div id="d3"></div>
+<div class="note">块内六个 1×1 conv 全部恒等直连（q=k=v=xs 同一特征场），注意力核直接作用于 SPS 特征。可训练槽 12（head + QAM）。
+<b>无投影的 q⊙kv 退化为自门控</b>：10ep 低于纯线性探针（11.90）——双线性注意力核的判别力完全依赖投影层，恒等直连只剩 LIF 非线性损耗。</div>
+</div>
+
+<div class="card"><h2>图 4 · probe 纯线性探针（--blocks probe）</h2>
+<div><span class="badge b-best">100ep 22.40% —— ES 线最高（终点=峰值，未过拟合）</span></div>
+<div id="d4"></div>
+<div class="note">SPS（冻结）→ H·W 均值池化 → 线性 head。无 LIF、无块、无 QAM；可训练槽 2（head LoRA+bias）。
+<b>唯一的深度 0 可训练坐标</b>：扰动与读出之间无非线性界面 → 景观平滑 → ES 信号满秩。
+22.40% 超过历史全部 ES 纪录（17.15/17.30/18.24）+5pp——此前测到的"天花板"是块结构噪声，不是 ES 上限。</div>
+</div>
+
+<div class="card"><h2>图 5 · 混合估计器（train-mixed，对照）</h2>
+<div><span class="badge b-warn">100ep 58.70%（&lt; 纯 SGD 66.10%，净负）</span></div>
+<div id="d5"></div>
+<div class="note">双轨交替：SGD（精确梯度）管全部平滑权重；ES 只管 v_th（8 标量）+ QAM（5120）。失败诊断：v_th 漂移无收敛
+（1.00→1.63）成为 SGD 的移动目标；STE 下 v_th 本就可微，ES 的不可替代域 = 完全无梯度场景。</div>
+</div>
+
+<div class="card"><h2>图 6 · 消融结果对比（100ep best_val）</h2>
+<div id="d6"></div>
+<div class="note">post-LIF 可训练槽越多/越深 → 精度单调下降。<b>最优 ES 配置 = 只保留深度 0 坐标（head）</b>；
+QAM 在冻结基座上仍是净正（C vs D：+0.65pp）。SGD 参考 66.10%（同数据同起点，图外）。</div>
+</div>
+
+<div class="card">
+<h2>槽位/结果汇总表</h2>
+<table>
+<tr><th>方案</th><th>CLI</th><th>块结构</th><th>可训练槽</th><th>深度0槽</th><th>post-LIF槽</th><th>100ep best</th></tr>
+<tr><td>A 线性探针</td><td>--blocks probe</td><td>无</td><td>head×2</td><td>2</td><td><b>0</b></td><td><b>22.40%</b></td></tr>
+<tr><td>C 冻结+QAM</td><td>--freeze-lora --qam learnable --qam-sites ssa</td><td>conv（冻结权重）</td><td>bias13+head2+QAM10</td><td>2</td><td>23</td><td>17.60%</td></tr>
+<tr><td>E0 全训练+QAM</td><td>--qam learnable --qam-sites ssa</td><td>conv</td><td>lora13+bias13+QAM10</td><td>2</td><td>35</td><td>17.15%</td></tr>
+<tr><td>D 冻结无QAM</td><td>--freeze-lora</td><td>conv（冻结权重）</td><td>bias13+head2</td><td>2</td><td>13</td><td>16.95%</td></tr>
+<tr><td>B 全训练无QAM</td><td>（默认）</td><td>conv</td><td>lora13+bias13</td><td>2</td><td>25</td><td>14.35%</td></tr>
+<tr><td>none+QAM</td><td>--blocks none --qam learnable --qam-sites ssa</td><td>恒等直连</td><td>head2+QAM10</td><td>2</td><td>10</td><td>（10ep 11.25%）</td></tr>
+<tr><td>参考 SGD</td><td>train（反传）</td><td>conv</td><td>全部 ~2.56M</td><td>—</td><td>—</td><td>66.10%</td></tr>
+</table>
+<p class="note">位点 id：0=xs 1=q 2=k 3=v 4=kv 5=x1 6=x2 7=feat；QAM ssa = 位点 {0,1,2,3,4}。生成于分支 es-no-conv（commit 68272c6 之后的文档快照）。</p>
+</div>
+
+<script>
+const C = {
+  frozen:'#eceff1', frozenS:'#90a4ae', lora:'#e3f0fb', loraS:'#4a90d9',
+  op:'#fffde7', opS:'#fbc02d', head:'#e8f5e9', headS:'#7cb342',
+  out:'#f3e5f5', outS:'#8e24aa', qam:'#f5a623', idS:'#9e9e9e', txt:'#37474f'
+};
+function esc(s){return s.replace(/&/g,'&amp;').replace(/</g,'&lt;');}
+function rbox(x,y,w,h,fill,stroke,l1,l2,extra=''){
+  const cx=x+w/2; let t=`<text x="${cx}" y="${y+(l2?h/2-4:h/2+5)}" text-anchor="middle" font-size="13" fill="${C.txt}" font-weight="600">${esc(l1)}</text>`;
+  if(l2) t+=`<text x="${cx}" y="${y+h/2+14}" text-anchor="middle" font-size="11.5" fill="#78909c">${esc(l2)}</text>`;
+  return `<rect x="${x}" y="${y}" width="${w}" height="${h}" rx="8" fill="${fill}" stroke="${stroke}" stroke-width="1.6" ${extra}/>`+t;
+}
+function arr(x1,y1,x2,y2,color='#90a4ae',dash=''){
+  return `<line x1="${x1}" y1="${y1}" x2="${x2}" y2="${y2}" stroke="${color}" stroke-width="1.6" ${dash?`stroke-dasharray="${dash}"`:''} marker-end="url(#ah)"/>`;
+}
+function qamBadge(x,y,site){
+  return `<circle cx="${x}" cy="${y}" r="11" fill="${C.qam}" stroke="#e65100"/><text x="${x}" y="${y+4}" text-anchor="middle" font-size="10.5" fill="#fff" font-weight="700">m${site}</text>`;
+}
+function idWire(pts,label,lx,ly){
+  let d=`M ${pts[0][0]} ${pts[0][1]} `;
+  for(let i=1;i<pts.length;i++) d+=`L ${pts[i][0]} ${pts[i][1]} `;
+  return `<path d="${d}" fill="none" stroke="${C.idS}" stroke-width="1.5" stroke-dasharray="5 4"/>`+
+         `<text x="${lx}" y="${ly}" font-size="11" fill="#9e9e9e">${esc(label)}</text>`;
+}
+function wrap(inner,w,h){
+  return `<svg viewBox="0 0 ${w} ${h}" xmlns="http://www.w3.org/2000/svg">
+  <defs><marker id="ah" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto"><path d="M0,0 L8,4 L0,8 z" fill="#90a4ae"/></marker></defs>${inner}</svg>`;
+}
+
+// ---- 图1/图2：conv 全训练 / 冻结 ----
+function convDiagram(mode){
+  const lock = mode==='freeze';
+  const cCls = lock? [C.frozen,C.frozenS] : [C.lora,C.loraS];
+  const cTag = lock? '🔒 σ=0 冻结（预训练值）' : 'LoRA 槽 + bias 槽';
+  let s='';
+  s+=rbox(40,20,200,40,C.frozen,C.frozenS,'输入图像 [T,B,3,32,32]');
+  s+=arr(140,60,140,88);
+  s+=rbox(40,88,200,64,C.frozen,C.frozenS,'SPS 卷积干（冻结）','4×(conv→LIF)+rpe · ~765k');
+  s+=arr(140,152,140,190); s+=`<text x="150" y="176" font-size="11" fill="#78909c">x</text>`;
+  // block container
+  s+=`<rect x="30" y="190" width="910" height="252" rx="12" fill="none" stroke="#b0bec5" stroke-width="1.4" stroke-dasharray="7 5"/>`;
+  s+=`<text x="52" y="212" font-size="13" fill="#546e7a" font-weight="700">Transformer Block × 2</text>`;
+  // SSA row
+  s+=rbox(50,226,130,48,C.op,C.opS,'xs = LIF(x)','θ=1.0 · 位点0');
+  s+=arr(180,250,198,250);
+  s+=rbox(200,226,160,48,cCls[0],cCls[1],'q/k/v 1×1 conv ×3',cTag);
+  s+=arr(360,250,378,250);
+  s+=rbox(380,226,88,48,C.op,C.opS,'LIF ×3','位点1/2/3');
+  s+=arr(468,250,486,250);
+  s+=rbox(488,226,158,48,C.op,C.opS,'kv = Σt(kh⊙vh)','→ LIF(0.5) · 位点4');
+  s+=arr(646,250,664,250);
+  s+=rbox(666,226,96,48,C.op,C.opS,'q ⊙ kv','');
+  s+=arr(762,250,780,250);
+  s+=rbox(782,226,148,48,cCls[0],cCls[1],'proj 1×1 conv',cTag);
+  // identity residual (block input -> proj output)
+  s+=idWire([[140,152],[26,250],[26,340],[952,340],[952,262],[934,262]],'恒等残差 +identity',30,352);
+  // MLP row
+  s+=arr(860,274,860,318); // ssa_out down to MLP row (stylized)
+  s+=`<text x="868" y="300" font-size="11" fill="#78909c">ssa_out</text>`;
+  s+=rbox(50,318,140,48,C.op,C.opS,'x1 = LIF(ssa)','位点5');
+  s+=arr(190,342,208,342);
+  s+=rbox(210,318,150,48,cCls[0],cCls[1],'fc1 1×1 conv','256→1024 · '+cTag);
+  s+=arr(360,342,378,342);
+  s+=rbox(380,318,88,48,C.op,C.opS,'LIF','位点6');
+  s+=arr(468,342,486,342);
+  s+=rbox(488,318,150,48,cCls[0],cCls[1],'fc2 1×1 conv','1024→256 · '+cTag);
+  s+=arr(638,342,656,342);
+  s+=`<circle cx="672" cy="342" r="13" fill="#fff" stroke="#78909c" stroke-width="1.6"/><text x="672" y="347" text-anchor="middle" font-size="14" fill="#455a64">+</text>`;
+  s+=idWire([[700,268],[672,300],[672,328]],'',0,0);
+  s+=arr(686,342,700,342);
+  s+=`<rect x="700" y="318" width="180" height="48" rx="8" fill="none" stroke="#b0bec5" stroke-width="1.2"/><text x="790" y="347" text-anchor="middle" font-size="12.5" fill="#546e7a">Block 输出（→ 下一块）</text>`;
+  // head row
+  s+=arr(140,442,140,462);
+  s+=rbox(50,462,180,48,C.op,C.opS,'flatten + H·W 均值','');
+  s+=arr(230,486,248,486);
+  s+=rbox(250,462,110,48,C.op,C.opS,'LIF θ=1.0','位点7');
+  s+=arr(360,486,378,486);
+  s+=rbox(380,462,190,48,C.head,C.headS,'Linear 256→10','[head: LoRA + bias 槽]');
+  s+=arr(570,486,588,486);
+  s+=rbox(590,462,120,48,C.op,C.opS,'时间平均 ÷T','');
+  s+=arr(710,486,728,486);
+  s+=rbox(730,462,130,48,C.out,C.outS,'logits [B,10]');
+  // QAM badges (ssa sites 0,1,2,3,4,7)
+  s+=qamBadge(115,214,0)+qamBadge(280,214,1)+qamBadge(424,214,2)+qamBadge(567,214,4)+qamBadge(305,450,7);
+  s+=`<text x="640" y="560" font-size="12" fill="#e65100">橙色 m◇ = QAM 调制位点（I_mod = I ⊙ m，m=(1+a)·cos φ 每神经元；对偶 θ→θ/m、β→β·m）；--qam off 时不存在</text>`;
+  return wrap(s,970,590);
+}
+
+// ---- 图3：none 恒等直连 ----
+function noneDiagram(){
+  let s='';
+  s+=rbox(40,20,200,40,C.frozen,C.frozenS,'输入图像 [T,B,3,32,32]');
+  s+=arr(140,60,140,88);
+  s+=rbox(40,88,200,64,C.frozen,C.frozenS,'SPS 卷积干（冻结）','4×(conv→LIF)+rpe');
+  s+=arr(140,152,140,190); s+=`<text x="150" y="176" font-size="11" fill="#78909c">x</text>`;
+  s+=`<rect x="30" y="190" width="910" height="252" rx="12" fill="none" stroke="#b0bec5" stroke-width="1.4" stroke-dasharray="7 5"/>`;
+  s+=`<text x="52" y="212" font-size="13" fill="#546e7a" font-weight="700">Block × 2（全部投影恒等）</text>`;
+  s+=rbox(50,226,130,48,C.op,C.opS,'xs = LIF(x)','位点0');
+  s+=arr(180,250,198,250);
+  s+=rbox(200,226,170,48,'none',C.idS,'q/k/v：恒等直连','q = k = v = xs（虚线=无权重）','stroke-dasharray="5 4"');
+  s+=arr(370,250,388,250);
+  s+=rbox(390,226,158,48,C.op,C.opS,'kh⊙vh → Σt','→ LIF(0.5) · 位点4');
+  s+=arr(548,250,566,250);
+  s+=rbox(568,226,110,48,C.op,C.opS,'q ⊙ kv','（自门控退化）');
+  s+=arr(678,250,696,250);
+  s+=rbox(698,226,140,48,'none',C.idS,'proj：恒等','', 'stroke-dasharray="5 4"');
+  s+=idWire([[140,152],[26,340],[952,340],[952,262],[842,262]],'恒等残差',30,352);
+  s+=arr(840,274,840,318);
+  s+=rbox(50,318,140,48,C.op,C.opS,'x1 = LIF(ssa)','位点5');
+  s+=arr(190,342,208,342);
+  s+=rbox(210,318,150,48,'none',C.idS,'fc1：恒等','','stroke-dasharray="5 4"');
+  s+=arr(360,342,378,342);
+  s+=rbox(380,318,88,48,C.op,C.opS,'LIF','位点6');
+  s+=arr(468,342,486,342);
+  s+=rbox(488,318,150,48,'none',C.idS,'fc2：恒等','','stroke-dasharray="5 4"');
+  s+=arr(638,342,656,342);
+  s+=`<circle cx="672" cy="342" r="13" fill="#fff" stroke="#78909c" stroke-width="1.6"/><text x="672" y="347" text-anchor="middle" font-size="14" fill="#455a64">+</text>`;
+  s+=idWire([[700,268],[672,300],[672,328]],'',0,0);
+  s+=arr(686,342,700,342);
+  s+=`<rect x="700" y="318" width="180" height="48" rx="8" fill="none" stroke="#b0bec5" stroke-width="1.2"/><text x="790" y="347" text-anchor="middle" font-size="12.5" fill="#546e7a">Block 输出</text>`;
+  s+=arr(140,442,140,462);
+  s+=rbox(50,462,180,48,C.op,C.opS,'flatten + H·W 均值','');
+  s+=arr(230,486,248,486);
+  s+=rbox(250,462,110,48,C.op,C.opS,'LIF θ=1.0','位点7');
+  s+=arr(360,486,378,486);
+  s+=rbox(380,462,190,48,C.head,C.headS,'Linear 256→10','[head: LoRA + bias 槽]');
+  s+=arr(570,486,588,486);
+  s+=rbox(590,462,120,48,C.op,C.opS,'时间平均 ÷T','');
+  s+=arr(710,486,728,486);
+  s+=rbox(730,462,130,48,C.out,C.outS,'logits [B,10]');
+  s+=qamBadge(115,214,0)+qamBadge(469,214,4)+qamBadge(120,306,5)+qamBadge(424,306,6)+qamBadge(305,450,7);
+  s+=`<text x="620" y="560" font-size="12" fill="#e65100">QAM 仅存位点 {0,4,5,6,7}（q/k/v 位点随恒等投影塌缩到 xs）</text>`;
+  return wrap(s,970,590);
+}
+
+// ---- 图4：probe ----
+function probeDiagram(){
+  let s='';
+  s+=rbox(40,30,200,40,C.frozen,C.frozenS,'输入图像 [T,B,3,32,32]');
+  s+=arr(140,70,140,98);
+  s+=rbox(40,98,200,64,C.frozen,C.frozenS,'SPS 卷积干（冻结）','4×(conv→LIF)+rpe');
+  s+=arr(140,162,140,190);
+  s+=rbox(40,190,220,48,C.op,C.opS,'H·W 均值池化','[T,B,256,8,8] → [T,B,256]');
+  s+=arr(260,214,278,214);
+  s+=rbox(280,190,210,48,C.head,C.headS,'Linear 256→10','[head: LoRA + bias 槽]（深度 0）');
+  s+=arr(490,214,508,214);
+  s+=rbox(510,190,150,48,C.op,C.opS,'时间平均 ÷T','');
+  s+=arr(660,214,678,214);
+  s+=rbox(680,190,140,48,C.out,C.outS,'logits [B,10]');
+  s+=`<text x="40" y="280" font-size="12.5" fill="#1b5e20" font-weight="600">无 LIF · 无块 · 无 QAM —— 扰动与读出之间零非线性界面 → 适应度景观平滑，ES 信号满秩（唯一被验证"积极可训"的配置）</text>`;
+  return wrap(s,960,310);
+}
+
+// ---- 图5：混合估计器 ----
+function mixedDiagram(){
+  let s='';
+  s+=`<rect x="30" y="40" width="900" height="150" rx="12" fill="#f5fafd" stroke="#4a90d9" stroke-width="1.4"/>`;
+  s+=`<text x="52" y="64" font-size="13.5" fill="#0d47a1" font-weight="700">SGD 轨（每 epoch：62 步 × batch 128，精确梯度）</text>`;
+  s+=rbox(50,80,150,48,'#e3f0fb','#4a90d9','minibatch 128','');
+  s+=arr(200,104,218,104);
+  s+=rbox(220,80,210,48,'#e3f0fb','#4a90d9','forward（含当前 m/v_th）','');
+  s+=arr(430,104,448,104);
+  s+=rbox(450,80,120,48,'#e3f0fb','#4a90d9','CE loss','');
+  s+=arr(570,104,588,104);
+  s+=rbox(590,80,170,48,'#e3f0fb','#4a90d9','backward（STE 代理）','∂L/∂W 精确');
+  s+=arr(760,104,778,104);
+  s+=rbox(780,80,130,48,'#e3f0fb','#4a90d9','SGD step','momentum 0.9');
+  s+=`<text x="52" y="152" font-size="12" fill="#0d47a1">范围：全部 W/b + SPS（~2.56M 参数）——梯度可用坐标</text>`;
+  s+=`<rect x="30" y="230" width="900" height="150" rx="12" fill="#fffaf3" stroke="#f5a623" stroke-width="1.4"/>`;
+  s+=`<text x="52" y="254" font-size="13.5" fill="#e65100" font-weight="700">ES 轨（每 epoch：1 次更新，pop=8000 反对称对）</text>`;
+  s+=rbox(50,270,170,48,'#fff3e0','#f5a623','候选 = 训练图','θ ± σε（v_th/QAM）');
+  s+=arr(220,294,238,294);
+  s+=rbox(240,270,180,48,'#fff3e0','#f5a623','松弛 fitness','σ(β(h−θ)) 逐候选 loglik');
+  s+=arr(420,294,438,294);
+  s+=rbox(440,270,120,48,'#fff3e0','#f5a623','z-score','全局');
+  s+=arr(560,294,578,294);
+  s+=rbox(580,270,150,48,'#fff3e0','#f5a623','AdamW-es','lr 0.02 · wd 0');
+  s+=arr(730,294,748,294);
+  s+=rbox(750,270,160,48,'#fff3e0','#f5a623','v_th 8 + QAM 5120','对偶坐标（低维）');
+  s+=`<text x="52" y="342" font-size="12" fill="#e65100">范围：v_th（8 位点标量）+ QAM (a,φ)——W/b 前向零噪声；验证 = 硬前向</text>`;
+  s+=arr(480,190,480,228,'#8e24aa','5 4');
+  s+=`<text x="492" y="214" font-size="12" fill="#8e24aa">ES 输出 m/v_th → 进入下一 epoch 的 SGD 前向（移动目标 ← 干扰源）</text>`;
+  return wrap(s,960,400);
+}
+
+// ---- 图6：柱状对比 ----
+function barDiagram(){
+  const data=[
+    ['A probe（仅head）',22.40,'#7cb342'],
+    ['C 冻结+QAM ssa',17.60,'#4a90d9'],
+    ['E0 全训练+QAM ssa',17.15,'#4a90d9'],
+    ['D 冻结 无QAM',16.95,'#90a4ae'],
+    ['B 全训练 无QAM',14.35,'#90a4ae'],
+  ];
+  const W=960,H=320,left=230,max=25;
+  let s='';
+  s+=`<line x1="${left}" y1="30" x2="${left}" y2="${H-40}" stroke="#90a4ae" stroke-width="1.5"/>`;
+  for(let g=0;g<=max;g+=5){
+    const y=H-40-(g/max)*(H-80);
+    s+=`<line x1="${left}" y1="${y}" x2="${W-30}" y2="${y}" stroke="#eceff1"/>`+
+       `<text x="${left-8}" y="${y+4}" text-anchor="end" font-size="11" fill="#78909c">${g}%</text>`;
+  }
+  data.forEach((d,i)=>{
+    const bw=(W-left-60)/data.length-14, x=left+18+i*((W-left-40)/data.length);
+    const h=(d[1]/max)*(H-80), y=H-40-h;
+    s+=`<rect x="${x}" y="${y}" width="${bw}" height="${h}" fill="${d[2]}" opacity="0.9" rx="4"/>`;
+    s+=`<text x="${x+bw/2}" y="${y-8}" text-anchor="middle" font-size="13" font-weight="700" fill="#37474f">${d[1].toFixed(2)}%</text>`;
+    const words=d[0].split(' ');
+    s+=`<text x="${x+bw/2}" y="${H-22}" text-anchor="middle" font-size="11.5" fill="#455a64">${esc(words[0])}</text>`;
+    if(words[1]) s+=`<text x="${x+bw/2}" y="${H-8}" text-anchor="middle" font-size="11.5" fill="#455a64">${esc(words.slice(1).join(' '))}</text>`;
+  });
+  s+=`<text x="${W-30}" y="18" text-anchor="end" font-size="11.5" fill="#8e24aa">参考：SGD 同设定 66.10%（反传，图外）</text>`;
+  return wrap(s,W,H);
+}
+
+document.getElementById('d1').innerHTML=convDiagram('full');
+document.getElementById('d2').innerHTML=convDiagram('freeze');
+document.getElementById('d3').innerHTML=noneDiagram();
+document.getElementById('d4').innerHTML=probeDiagram();
+document.getElementById('d5').innerHTML=mixedDiagram();
+document.getElementById('d6').innerHTML=barDiagram();
+</script>
+</body>
+</html>
