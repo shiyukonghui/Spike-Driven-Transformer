@@ -1144,6 +1144,10 @@ enum FLoc {
     HeadB,
     Qam(usize, u8),
     Vth(usize),
+    /// 普通 SNN（--blocks fc）：fc 层权重 [out,in]，k=0,1,2
+    FcW(usize),
+    /// 普通 SNN：fc 层偏置 [n]
+    FcB(usize),
 }
 
 /// factored 槽规格（lora=权重走因式噪声；dense=偏置走加性噪声）
@@ -1220,6 +1224,30 @@ fn factored_slots(
     let mut lora = Vec::new();
     let mut dense = Vec::new();
     let mut ki = 0u64;
+    if blocks == "fc" {
+        // 普通 SNN（HyperscaleES 主场）：fc1[128,3072]→LIF→fc2[128,128]→LIF→fc3[10,128]
+        // + 偏置×3 + QAM（LIF1/LIF2 输入电流调制，各 128 神经元）。基底随机初始化。
+        const FC_HIDE: usize = 128;
+        lora.push(FSlotSpec { loc: FLoc::FcW(0), key: (ki + 1).wrapping_mul(KEY_MUL), shape: OrigShape::W2([FC_HIDE, 3072]) });
+        ki += 1;
+        lora.push(FSlotSpec { loc: FLoc::FcW(1), key: (ki + 1).wrapping_mul(KEY_MUL), shape: OrigShape::W2([FC_HIDE, FC_HIDE]) });
+        ki += 1;
+        lora.push(FSlotSpec { loc: FLoc::FcW(2), key: (ki + 1).wrapping_mul(KEY_MUL), shape: OrigShape::W2([10, FC_HIDE]) });
+        ki += 1;
+        dense.push(FSlotSpec { loc: FLoc::FcB(0), key: (ki + 1).wrapping_mul(KEY_MUL), shape: OrigShape::B1(FC_HIDE) });
+        ki += 1;
+        dense.push(FSlotSpec { loc: FLoc::FcB(1), key: (ki + 1).wrapping_mul(KEY_MUL), shape: OrigShape::B1(FC_HIDE) });
+        ki += 1;
+        dense.push(FSlotSpec { loc: FLoc::FcB(2), key: (ki + 1).wrapping_mul(KEY_MUL), shape: OrigShape::B1(10) });
+        ki += 1;
+        for &site in qam_sites {
+            dense.push(FSlotSpec { loc: FLoc::Qam(site, 0), key: (ki + 1).wrapping_mul(KEY_MUL), shape: OrigShape::B1(FC_HIDE) });
+            ki += 1;
+            dense.push(FSlotSpec { loc: FLoc::Qam(site, 1), key: (ki + 1).wrapping_mul(KEY_MUL), shape: OrigShape::B1(FC_HIDE) });
+            ki += 1;
+        }
+        return (lora, dense);
+    }
     if blocks != "conv" {
         // none/probe：无块卷积槽；none 保留 head+QAM（+vth），probe 只留 head
         lora.push(FSlotSpec {
@@ -2113,6 +2141,220 @@ fn es_forward_probe(
     logits3.sum_dim(1).squeeze::<2>().div_scalar(tt as f32)
 }
 
+// ---------------------------------------------------------------------------
+// 普通 SNN（--blocks fc）：HyperscaleES 主场——全 FC-LIF，无 SPS/无注意力。
+// 展平像素[3072] → fc1[128]→LIF(0.3) → fc2[128]→LIF(0.3) → fc3[10] 时间平均读出。
+// 基底随机初始化（N(0, 1/√fan_in)），ES 逐 epoch 累积低秩更新（从零训练语义）。
+// ---------------------------------------------------------------------------
+
+struct FcBase<B: Backend> {
+    w1: Tensor<B, 2>, // [128, 3072]
+    b1: Tensor<B, 1>, // [128]
+    w2: Tensor<B, 2>, // [128, 128]
+    b2: Tensor<B, 1>, // [128]
+    w3: Tensor<B, 2>, // [10, 128]
+    b3: Tensor<B, 1>, // [10]
+}
+
+fn gen_fc_base(seed: u64, device: &Dev) -> FcBase<B> {
+    let mut rng = DeterministicNoise::new(seed);
+    let (h, inp) = (128usize, 3072usize);
+    let w1: Vec<f32> = (0..h * inp).map(|_| rng.standard_normal() * (inp as f32).sqrt().recip()).collect();
+    let w2: Vec<f32> = (0..h * h).map(|_| rng.standard_normal() * (h as f32).sqrt().recip()).collect();
+    let w3: Vec<f32> = (0..10 * h).map(|_| rng.standard_normal() * (h as f32).sqrt().recip()).collect();
+    let b1 = Tensor::<B, 1>::from_data(burn::tensor::TensorData::new(vec![0.0_f32; h], [h]), device);
+    let b2 = Tensor::<B, 1>::from_data(burn::tensor::TensorData::new(vec![0.0_f32; h], [h]), device);
+    let b3 = Tensor::<B, 1>::from_data(burn::tensor::TensorData::new(vec![0.0_f32; 10], [10]), device);
+    FcBase {
+        w1: Tensor::<B, 2>::from_data(burn::tensor::TensorData::new(w1, [h, inp]), device),
+        b1,
+        w2: Tensor::<B, 2>::from_data(burn::tensor::TensorData::new(w2, [h, h]), device),
+        b2,
+        w3: Tensor::<B, 2>::from_data(burn::tensor::TensorData::new(w3, [10, h]), device),
+        b3,
+    }
+}
+
+/// 普通 SNN 前向（噪声候选口径）：候选 [C]，时间 [T]，与 SDT 管线同 relax/β/QAM 机制
+fn es_forward_fc(
+    images: Tensor<B, 5>,
+    base_fc: &FcBase<B>,
+    f: &ChunkFactors,
+    relax: bool,
+    beta: f32,
+    qam: Option<&QamRun<B>>,
+) -> Tensor<B, 2> {
+    let d = images.dims();
+    let (t, c) = (d[0], d[1]);
+    let x3 = images.reshape([t, c, 3072]).permute([1, 0, 2]); // [C,T,3072]
+
+    let lif_fc = |cur: Tensor<B, 3>| -> Tensor<B, 3> {
+        // [C,T,128] → LIF over T（v_th=0.3，与原始库一致；naive 1.0 会静默网络）
+        let r5 = cur.permute([1, 0, 2]).reshape([t, c, 128, 1, 1]);
+        let s = if relax {
+            lif_seq_relaxed(r5, 0.3, beta as f64)
+        } else {
+            lif_seq(r5, 0.3)
+        };
+        s.reshape([t, c, 128]).permute([1, 0, 2])
+    };
+
+    // fc1
+    let (a1, b1) = &f.lora[0];
+    let base_cur = x3
+        .clone()
+        .reshape([c * t, 3072])
+        .matmul(base_fc.w1.clone().transpose())
+        .reshape([c, t, 128]);
+    let yn1 = x3.matmul(b1.clone().swap_dims(1, 2)).matmul(a1.clone()); // [C,T,128]
+    let mut cur1 = base_cur + yn1 + f.dense[0].clone().reshape([c, 1, 128]);
+    if let Some(m) = qam.and_then(|q| q.m(0)) {
+        cur1 = cur1 * m.reshape([c, 1, 128]);
+    }
+    let s1 = lif_fc(cur1);
+
+    // fc2
+    let (a2, b2) = &f.lora[1];
+    let base_cur2 = s1
+        .clone()
+        .reshape([c * t, 128])
+        .matmul(base_fc.w2.clone().transpose())
+        .reshape([c, t, 128]);
+    let yn2 = s1.matmul(b2.clone().swap_dims(1, 2)).matmul(a2.clone());
+    let mut cur2 = base_cur2 + yn2 + f.dense[1].clone().reshape([c, 1, 128]);
+    if let Some(m) = qam.and_then(|q| q.m(1)) {
+        cur2 = cur2 * m.reshape([c, 1, 128]);
+    }
+    let s2 = lif_fc(cur2);
+
+    // fc3 + 时间平均读出
+    let (a3, b3) = &f.lora[2];
+    let base_l = s2
+        .clone()
+        .reshape([c * t, 128])
+        .matmul(base_fc.w3.clone().transpose())
+        .reshape([c, t, 10]);
+    let yn3 = s2.matmul(b3.clone().swap_dims(1, 2)).matmul(a3.clone());
+    let logits3 = base_l + yn3 + f.dense[2].clone().reshape([c, 1, 10]);
+    logits3.sum_dim(1).squeeze::<2>().div_scalar(t as f32)
+}
+
+/// 普通 SNN 参数扁平化（fc 槽位 → params2d）
+fn factored_params2d_fc(base_fc: &FcBase<B>, lora: &[FSlotSpec], dense: &[FSlotSpec], device: &Dev) -> Vec<Tensor<B, 2>> {
+    let mut out = Vec::new();
+    for slot in lora {
+        let t = match slot.loc {
+            FLoc::FcW(k) => {
+                let w = match k {
+                    0 => &base_fc.w1,
+                    1 => &base_fc.w2,
+                    _ => &base_fc.w3,
+                };
+                flatten_slot(&slot.shape, w)
+            }
+            _ => unreachable!("fc lora 列表只含 FcW"),
+        };
+        out.push(t);
+    }
+    for slot in dense {
+        let t = match slot.loc {
+            FLoc::FcB(k) => {
+                let b = match k {
+                    0 => &base_fc.b1,
+                    1 => &base_fc.b2,
+                    _ => &base_fc.b3,
+                };
+                flatten_slot(&slot.shape, b)
+            }
+            FLoc::Qam(_, 0) => {
+                let n = slot.shape.orig_dims()[0];
+                Tensor::<B, 1>::from_data(burn::tensor::TensorData::new(vec![0.1_f32; n], [n]), device)
+                    .reshape([n, 1])
+            }
+            FLoc::Qam(_, 1) => {
+                let n = slot.shape.orig_dims()[0];
+                Tensor::<B, 1>::from_data(burn::tensor::TensorData::new(vec![0.5_f32; n], [n]), device)
+                    .reshape([n, 1])
+            }
+            _ => unreachable!("fc dense 列表只含 FcB/Qam"),
+        };
+        out.push(t);
+    }
+    out
+}
+
+/// 普通 SNN 写回
+fn write_back_fc(base_fc: &mut FcBase<B>, lora: &[FSlotSpec], dense: &[FSlotSpec], params: &[Tensor<B, 2>]) {
+    let nl = lora.len();
+    for (i, slot) in lora.iter().enumerate() {
+        let dims = slot.shape.orig_dims();
+        let t: Tensor<B, 2> = params[i].clone().reshape([dims[0], dims[1]]);
+        match slot.loc {
+            FLoc::FcW(0) => base_fc.w1 = t,
+            FLoc::FcW(1) => base_fc.w2 = t,
+            FLoc::FcW(_) => base_fc.w3 = t,
+            _ => unreachable!("fc lora 列表只含 FcW"),
+        }
+    }
+    for (di, slot) in dense.iter().enumerate() {
+        let i = nl + di;
+        let n = slot.shape.orig_dims()[0];
+        match slot.loc {
+            FLoc::FcB(0) => base_fc.b1 = params[i].clone().reshape([n]),
+            FLoc::FcB(1) => base_fc.b2 = params[i].clone().reshape([n]),
+            FLoc::FcB(_) => base_fc.b3 = params[i].clone().reshape([n]),
+            FLoc::Qam(_, _) => {}
+            _ => unreachable!("fc dense 列表只含 FcB/Qam"),
+        }
+    }
+}
+
+/// 普通 SNN 验证（零噪声，评估口径 QamRun）
+#[allow(clippy::too_many_arguments)]
+fn eval_es_fc(
+    base_fc: &FcBase<B>,
+    lora_slots: &[FSlotSpec],
+    dense_slots: &[FSlotSpec],
+    rank: usize,
+    qam_eval: Option<&QamWeights<B>>,
+    data: &Cifar10Npz,
+    batch: usize,
+    t_steps: usize,
+) -> f64 {
+    let device = es_dev();
+    let n = data.n_test;
+    let order: Vec<usize> = (0..n).collect();
+    let mut correct = 0usize;
+    for chunk in order.chunks(batch) {
+        let (images, targets) = data.get_batch(Split::Test, chunk, t_steps, device);
+        let c = chunk.len();
+        let factors = zero_factors(lora_slots, dense_slots, rank, c, device);
+        let qam_run = qam_run_zero(c, qam_eval, device);
+        let logits = es_forward_fc(images, base_fc, &factors, false, 4.0, qam_run.as_ref());
+        let pred = logits.argmax(1).reshape([chunk.len()]);
+        let pred_v: Vec<i64> = pred
+            .into_data()
+            .convert::<i64>()
+            .to_vec::<i64>()
+            .expect("读取预测失败");
+        let tgt_v: Vec<i64> = targets
+            .into_data()
+            .convert::<i64>()
+            .to_vec::<i64>()
+            .expect("读取标签失败");
+        for (p, y) in pred_v.iter().zip(tgt_v.iter()) {
+            if p == y {
+                correct += 1;
+            }
+        }
+        <B as burn::tensor::backend::Backend>::sync(device).expect("eval 逐批同步失败");
+        <B as burn::tensor::backend::Backend>::memory_cleanup(device);
+    }
+    <B as burn::tensor::backend::Backend>::sync(device).expect("eval 同步失败");
+    <B as burn::tensor::backend::Backend>::memory_cleanup(device);
+    correct as f64 / n as f64 * 100.0
+}
+
 /// factored 主参数列表（lora 13 槽在前、dense 13 槽+QAM 槽在后，顺序与 factored_slots 一致）
 fn factored_params2d(base: &SdtWeights<B>, lora: &[FSlotSpec], dense: &[FSlotSpec], device: &Dev) -> Vec<Tensor<B, 2>> {
     let mut out = Vec::new();
@@ -2120,8 +2362,8 @@ fn factored_params2d(base: &SdtWeights<B>, lora: &[FSlotSpec], dense: &[FSlotSpe
         let t = match slot.loc {
             FLoc::BlkW(j, which) => flatten_slot(&slot.shape, floc_get4(base, j, which)),
             FLoc::HeadW => flatten_slot(&slot.shape, &base.head_w),
-            FLoc::BlkB(_, _) | FLoc::HeadB | FLoc::Qam(_, _) | FLoc::Vth(_) => {
-                unreachable!("lora 列表不应含 dense/QAM/Vth 槽")
+            FLoc::BlkB(_, _) | FLoc::HeadB | FLoc::Qam(_, _) | FLoc::Vth(_) | FLoc::FcW(_) | FLoc::FcB(_) => {
+                unreachable!("lora 列表不应含 dense/QAM/Vth/Fc 槽")
             }
         };
         out.push(t);
@@ -2178,8 +2420,8 @@ fn write_back_factored(base: &mut SdtWeights<B>, lora: &[FSlotSpec], dense: &[FS
             FLoc::HeadW => {
                 base.head_w = params[i].clone().reshape([dims[0], dims[1]]);
             }
-            FLoc::BlkB(_, _) | FLoc::HeadB | FLoc::Qam(_, _) | FLoc::Vth(_) => {
-                unreachable!("lora 列表不应含 dense/QAM/Vth 槽")
+            FLoc::BlkB(_, _) | FLoc::HeadB | FLoc::Qam(_, _) | FLoc::Vth(_) | FLoc::FcW(_) | FLoc::FcB(_) => {
+                unreachable!("lora 列表不应含 dense/QAM/Vth/Fc 槽")
             }
         }
     }
@@ -2194,9 +2436,9 @@ fn write_back_factored(base: &mut SdtWeights<B>, lora: &[FSlotSpec], dense: &[FS
             FLoc::HeadB => {
                 base.head_b = params[i].clone().reshape([n]);
             }
-            FLoc::BlkW(_, _) | FLoc::HeadW => unreachable!("dense 列表不应含 lora 槽"),
-            // QAM/Vth 槽：状态就在 params2d 中（eval/mixed 时按槽列表重建），无写回
-            FLoc::Qam(_, _) | FLoc::Vth(_) => {}
+            FLoc::BlkW(_, _) | FLoc::HeadW | FLoc::FcW(_) => unreachable!("dense 列表不应含 lora 槽"),
+            // QAM/Vth/Fc 槽：状态就在 params2d 中（eval/mixed 时按槽列表重建），无写回
+            FLoc::Qam(_, _) | FLoc::Vth(_) | FLoc::FcB(_) => {}
         }
     }
 }
@@ -2245,9 +2487,24 @@ pub fn run_train_es_factored(args: EsArgs) {
     // QAM 位点（ES_MANIFOLD §12.3 位点深度律优先级）：head=feat 单位点（最高信号），
     // ssa=xs/q/k/v/kv，all=全部 8 位点；m 按位点类型跨 block 共享
     // probe 模式无 LIF，QAM 无处作用 → 强制关闭
+    // fc 模式（普通 SNN）：LIF1/LIF2 输入电流调制，head=位点0，ssa/all=位点{0,1}
     let probe_mode = args.blocks == "probe";
+    let fc_mode = args.blocks == "fc";
+    if fc_mode && args.baseline_zero {
+        panic!("普通 SNN（fc）模式暂不支持 --baseline-zero（锚点函数面向 SdtWeights）");
+    }
     let qam_sites: Vec<usize> = if probe_mode {
         Vec::new()
+    } else if fc_mode {
+        match args.qam.as_str() {
+            "off" => Vec::new(),
+            "learnable" => match args.qam_sites.as_str() {
+                "head" => vec![0],
+                "ssa" | "all" => vec![0, 1],
+                other => panic!("未知 --qam-sites: {other}（fc 模式可选 head|ssa|all）"),
+            },
+            other => panic!("未知 --qam: {other}（可选 off|learnable）"),
+        }
     } else {
         match args.qam.as_str() {
             "off" => Vec::new(),
@@ -2261,7 +2518,21 @@ pub fn run_train_es_factored(args: EsArgs) {
         }
     };
     let (lora_slots, dense_slots) = factored_slots(&base, cfg.depths, &qam_sites, &[], &args.blocks);
-    let mut params2d = factored_params2d(&base, &lora_slots, &dense_slots, device);
+    // fc 模式：随机初始化基底（从零训练语义），--weights 仅用于 conv/none/probe
+    let mut fc_base: Option<FcBase<B>> = if fc_mode {
+        println!(
+            "[普通SNN] 随机初始化 FC-LIF×2：3072→128→128→10，v_th=0.3（原始库口径），种子 {}",
+            args.seed
+        );
+        Some(gen_fc_base(args.seed, device))
+    } else {
+        None
+    };
+    let mut params2d = if fc_mode {
+        factored_params2d_fc(fc_base.as_ref().unwrap(), &lora_slots, &dense_slots, device)
+    } else {
+        factored_params2d(&base, &lora_slots, &dense_slots, device)
+    };
     let qam_slot_base = lora_slots.len() + dense_slots.len() - 2 * qam_sites.len(); // 第一个 QAM 槽在 params2d 的下标
     let all_shapes: Vec<OrigShape> = lora_slots
         .iter()
@@ -2508,6 +2779,7 @@ pub fn run_train_es_factored(args: EsArgs) {
                 "conv" => es_forward_factored(images, &base, &factors, &cfg, relax_fwd, relax_mlp, beta_t, qam_run.as_ref()), // [C, 10]
                 "none" => es_forward_noconv(images, &base, &factors, &cfg, relax_fwd, relax_mlp, beta_t, qam_run.as_ref()),
                 "probe" => es_forward_probe(images, &base, &factors, &cfg),
+                "fc" => es_forward_fc(images, fc_base.as_ref().unwrap(), &factors, relax_fwd, beta_t, qam_run.as_ref()),
                 other => panic!("未知 --blocks: {other}"),
             }; // [C, 10]
             let logsm = log_softmax2(logits.clone());
@@ -2612,7 +2884,11 @@ pub fn run_train_es_factored(args: EsArgs) {
                 params2d[i] = s;
             }
         }
-        write_back_factored(&mut base, &lora_slots, &dense_slots, &params2d);
+        if fc_mode {
+            write_back_fc(fc_base.as_mut().unwrap(), &lora_slots, &dense_slots, &params2d);
+        } else {
+            write_back_factored(&mut base, &lora_slots, &dense_slots, &params2d);
+        }
 
         // ---- 5) epoch 末 sync + cleanup ----
         <B as burn::tensor::backend::Backend>::sync(device).expect("GPU 同步失败");
@@ -2643,7 +2919,20 @@ pub fn run_train_es_factored(args: EsArgs) {
                 }
                 Some(QamWeights { sites, vth: Vec::new() })
             };
-            let val_top1 = eval_es_arch(&base, qam_eval.as_ref(), &data, 256, args.time_steps, &cfg, &args.blocks); // S9：批 64→256
+            let val_top1 = if fc_mode {
+                eval_es_fc(
+                    fc_base.as_ref().unwrap(),
+                    &lora_slots,
+                    &dense_slots,
+                    args.rank,
+                    qam_eval.as_ref(),
+                    &data,
+                    256,
+                    args.time_steps,
+                )
+            } else {
+                eval_es_arch(&base, qam_eval.as_ref(), &data, 256, args.time_steps, &cfg, &args.blocks) // S9：批 64→256
+            };
             if val_top1 > best_val {
                 best_val = val_top1;
             }
