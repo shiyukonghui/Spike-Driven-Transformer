@@ -648,6 +648,11 @@ pub struct EsArgs {
     pub fitness_hard: bool,
     /// fc 模式编码：static（静态重复，默认）| poisson（泊松率编码，原库默认）
     pub encoding: String,
+    /// 方差分解探针（K* 理论验证）：在 var_probe_epochs 指定的 epoch 执行
+    /// "同方向×多样本" 测量，写 fit 矩阵 CSV
+    pub var_probe: bool,
+    /// 探针执行 epoch 列表（逗号分隔，如 "0,40,80,119"）
+    pub var_probe_epochs: String,
 }
 
 /// 内层 wgpu 设备引用
@@ -2686,6 +2691,146 @@ pub fn run_train_es_factored(args: EsArgs) {
         let mut fwd_time = 0.0_f32;
         let n_chunks = args.pop / args.chunk;
         let order_vec: Vec<usize> = order.to_vec();
+
+        // ==== 方差分解探针（K* 理论验证）：同方向 × 多样本 ====
+        // 测 Var_data（样本特异性，1/K 衰减）与 Var_int（方向景观，不随 K 衰减），
+        // K* = Var_data / Var_int。fitness 矩阵落盘 CSV，离线做 1/K 验证。
+        if args.var_probe
+            && args
+                .var_probe_epochs
+                .split(',')
+                .filter_map(|s| s.trim().parse::<u32>().ok())
+                .any(|e| e == epoch)
+        {
+            let d_dirs = 128usize; // 探针方向数（64 反对称对）
+            let p_probe = 256usize; // 每方向样本数
+            let sb = 4usize; // 每次前向槽 = d_dirs × sb（cubecl 单 buffer 上限 2GB：4096 槽请求 2GB 被拒，512 槽 537MB 安全）
+            let t_probe = std::time::Instant::now();
+            println!(
+                "  [var-probe] ep{epoch}：方向 {d_dirs} × 样本 {p_probe}（{} 次前向）",
+                p_probe / sb
+            );
+            // 探针因子：ids 0..d_dirs（epoch 0 噪声，与训练噪声独立）；σ 用当前 epoch 口径
+            let probe_ids: Vec<usize> = (0..d_dirs).collect();
+            let pf = gen_chunk_factors_gpu(
+                &lora_slots, &dense_slots, &sigma_lora, &sigma_dense,
+                args.rank, &probe_ids, 0, device,
+            );
+            let mut fit_m = vec![0.0f32; d_dirs * p_probe];
+            let relax_fwd_p = args.relax && (beta_t < 16.0 || !args.hard_at_16);
+            let relax_mlp_p = relax_fwd_p && args.relax_scope != "ssa";
+            for s0 in (0..p_probe).step_by(sb) {
+                // 因子复制：槽 (d,s) = 方向 d × 样本 s0+s（[D,…] repeat → [D*SB,…]）
+                let rep3 = |t: &Tensor<B, 3>| t.clone().repeat_dim(0, sb);
+                let rep2 = |t: &Tensor<B, 2>| t.clone().repeat_dim(0, sb);
+                let rf: Vec<(Tensor<B, 3>, Tensor<B, 3>)> =
+                    pf.lora.iter().map(|(a, b)| (rep3(a), rep3(b))).collect();
+                let rd: Vec<Tensor<B, 2>> = pf.dense.iter().map(|t| rep2(t)).collect();
+                let rfac = ChunkFactors { lora: rf, dense: rd };
+                // QAM 运行时（复制后的 dense 噪声）
+                let qam_run_p = if qam_sites.is_empty() {
+                    None
+                } else {
+                    let nd_total = dense_slots.len();
+                    let mut sites = Vec::with_capacity(qam_sites.len());
+                    for (kk, &site) in qam_sites.iter().enumerate() {
+                        let ia = qam_slot_base + 2 * kk;
+                        let di = nd_total - 2 * qam_sites.len() + 2 * kk;
+                        sites.push((
+                            site,
+                            params2d[ia].clone(),
+                            params2d[ia + 1].clone(),
+                            rfac.dense[di].clone(),
+                            rfac.dense[di + 1].clone(),
+                        ));
+                    }
+                    Some(QamRun { sites, vth: Vec::new() })
+                };
+                // 图像：样本 s0..s0+sb 行，复制 d_dirs 次（槽 (d,s) ← 样本 s0+s）
+                // 样本连续 → 直接 narrow（onehot matmul 会物化 [slots, 50000]，超大）
+                let sel = pix_t.clone().narrow(0, s0, sb).repeat_dim(0, d_dirs); // [d_dirs*sb, 3072]
+                let n_slots = d_dirs * sb;
+                let images = sel
+                    .reshape([n_slots, 3, 32, 32])
+                    .reshape([1, n_slots, 3, 32, 32])
+                    .repeat_dim(0, args.time_steps);
+                let targets = lab_t
+                    .clone()
+                    .narrow(0, s0, sb)
+                    .repeat_dim(0, d_dirs); // [d_dirs*sb] Int
+                let logits = match args.blocks.as_str() {
+                    "conv" => es_forward_factored(
+                        images, &base, &rfac, &cfg, relax_fwd_p, relax_mlp_p, beta_t,
+                        qam_run_p.as_ref(),
+                    ),
+                    "fc" => es_forward_fc(
+                        images,
+                        fc_base.as_ref().unwrap(),
+                        &rfac,
+                        relax_fwd_p,
+                        beta_t,
+                        qam_run_p.as_ref(),
+                        fc_poisson,
+                    ),
+                    other => panic!("var-probe 不支持 --blocks: {other}"),
+                };
+                let logsm = log_softmax2(logits);
+                let fit = logsm
+                    .gather(1, targets.reshape([n_slots, 1]))
+                    .reshape([d_dirs, sb]);
+                let fit_v: Vec<f32> = fit
+                    .into_data()
+                    .convert::<f32>()
+                    .to_vec::<f32>()
+                    .expect("var-probe 读取 fitness 失败");                for d in 0..d_dirs {
+                    for s in 0..sb {
+                        fit_m[d * p_probe + s0 + s] = fit_v[d * sb + s];
+                    }
+                }
+            }
+            // 落盘：行=方向，列=样本
+            let path = format!("artifacts/varprobe_ep{epoch}.csv");
+            let mut lines = Vec::with_capacity(d_dirs + 1);
+            let mut hdr = String::from("dir");
+            for p in 0..p_probe {
+                hdr.push_str(&format!(",s{p}"));
+            }
+            lines.push(hdr);
+            for d in 0..d_dirs {
+                let mut row = format!("{d}");
+                for p in 0..p_probe {
+                    row.push_str(&format!(",{:.6}", fit_m[d * p_probe + p]));
+                }
+                lines.push(row);
+            }
+            let _ = std::fs::write(&path, lines.join("\n"));
+            // 快速两点估计：总方差（K=1）与 K=32 批均值方差 → Vd/Vi/K*
+            let total_var = {
+                let m: f32 = fit_m.iter().sum::<f32>() / fit_m.len() as f32;
+                fit_m.iter().map(|v| (v - m) * (v - m)).sum::<f32>() / fit_m.len() as f32
+            };
+            let kb = 32usize;
+            let mut bmeans = Vec::with_capacity(d_dirs * (p_probe / kb));
+            for d in 0..d_dirs {
+                for b in 0..p_probe / kb {
+                    let s: f32 = (0..kb).map(|k| fit_m[d * p_probe + b * kb + k]).sum::<f32>();
+                    bmeans.push(s / kb as f32);
+                }
+            }
+            let bm_var = {
+                let m: f32 = bmeans.iter().sum::<f32>() / bmeans.len() as f32;
+                bmeans.iter().map(|v| (v - m) * (v - m)).sum::<f32>() / bmeans.len() as f32
+            };
+            // Var[f̄_K] = Vd/K + Vi；K=1: Vd+Vi=total；K=32: Vd/32+Vi=bm_var
+            let vd = (total_var - bm_var) * 32.0 / 31.0;
+            let vi = (total_var - vd).max(0.0);
+            let kstar = if vi > 1e-9 { vd / vi } else { f32::INFINITY };
+            println!(
+                "  [var-probe] ep{epoch}：Var_total={total_var:.4} Var[f̄32]={bm_var:.4} → Vd={vd:.4} Vi={vi:.4} K*≈{kstar:.1}（{:.1}s）",
+                t_probe.elapsed().as_secs_f32()
+            );
+        }
+
         // X1 控制变量锚点：每 epoch 一次无噪声前向（当前 θ + 当前 QAM 基值），
         // 逐训练图 loglik b₀(x)。relax 口径与候选 fitness 一致（同 relax/β）。
         let anchors_gpu: Option<Tensor<B, 1>> = if args.baseline_zero {

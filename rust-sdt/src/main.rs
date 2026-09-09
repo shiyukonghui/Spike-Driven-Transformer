@@ -192,6 +192,12 @@ enum Command {
         /// fc 编码：static（默认）| poisson（泊松率编码，原库默认）
         #[arg(long, default_value = "static")]
         encoding: String,
+        /// 方差分解探针（K* 验证）：在 --var-probe-epochs 指定 epoch 测 Vd/Vi/K*
+        #[arg(long, default_value_t = false)]
+        var_probe: bool,
+        /// 探针执行 epoch 列表，如 "0,40,80,119"
+        #[arg(long, default_value = "0")]
+        var_probe_epochs: String,
     },
     /// 混合估计器（ES_MANIFOLD §13）：SGD（W/b 精确梯度）+ ES（v_th 8 标量 + QAM 低维槽）
     TrainMixed {
@@ -326,6 +332,8 @@ fn main() {
             robust_z,
             fitness_hard,
             encoding,
+            var_probe,
+            var_probe_epochs,
         } => {
             crate::es_train::run_train_es(crate::es_train::EsArgs {
                 epochs,
@@ -361,6 +369,8 @@ fn main() {
                 robust_z,
                 fitness_hard,
                 encoding,
+                var_probe,
+                var_probe_epochs,
             });
         }
         Command::TrainMixed {
